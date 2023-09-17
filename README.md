@@ -43,7 +43,7 @@ Alternatively, the software can be operated as Windows Program
 
 ## Usage
 Just run the program, make a mouse click, type and enjoy.<br>
-**There are some bugs. Will be fixed...**
+**If there are some bugs, let me know and I will fix'em...**
 
 ## Contributing
 
