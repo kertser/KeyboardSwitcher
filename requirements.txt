@@ -1,0 +1,15 @@
+# required for actual code:
+keyboard~=0.13.5
+pystray
+Pillow==10.0.1
+py_win_keyboard_layout
+pynput
+onnxruntime
+
+# required for training:
+# pandas
+# scikit-learn
+# tensorboard
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+auto-py-to-exe
