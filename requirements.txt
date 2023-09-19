@@ -5,6 +5,7 @@ Pillow==10.0.1
 py_win_keyboard_layout
 pynput
 onnxruntime
+pygetwindow
 
 # required for training:
 # pandas
@@ -12,4 +13,6 @@ onnxruntime
 # tensorboard
 # pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-auto-py-to-exe
+# required for compilation
+# auto-py-to-exe
+

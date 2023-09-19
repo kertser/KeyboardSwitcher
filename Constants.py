@@ -1,4 +1,5 @@
 SEARCH = False # Disable search functionality until a language is selected
+LastSetting = 'en' # Last language selected
 
 # Language codes for English, Russian, and Hebrew
 LANGUAGE_CODES = {
