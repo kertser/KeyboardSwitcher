@@ -1,4 +1,6 @@
+EnableSwitcher = True # Enable switching between languages
 SEARCH = False # Disable search functionality until a language is selected
+SaveWindowState = True # Save the window state when switching between languages
 LastSetting = 'en' # Last language selected
 
 # Language codes for English, Russian, and Hebrew

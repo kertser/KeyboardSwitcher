@@ -10,7 +10,7 @@ import py_win_keyboard_layout
 from pynput import keyboard, mouse
 import ctypes # for keyboard layout codes
 import sys
-import Constants # project constants
+import config # project constants and settings
 import time
 import warnings
 import pygetwindow as gw # window title search
@@ -51,7 +51,7 @@ class OpenWindows():
         self.windows_language = {}
         available_windows = gw.getAllTitles()
         for window in available_windows:
-            self.windows_language[window] = Constants.LANGUAGE_ID[language]
+            self.windows_language[window] = config.LANGUAGE_ID[language]
             # print(f"Window: {window} Language: {self.windows_language[window]}")
 
     # Get the language setup for the active window
@@ -76,12 +76,38 @@ class OpenWindows():
                 updated_windows_language[window] = self.windows_language[window]
         self.windows_language = updated_windows_language
 
+def get_keyboard_layout():
+    # Get the keyboard layout for windows
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    klid = ctypes.windll.user32.GetKeyboardLayout(ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0))
+
+    # Extract the language ID from the keyboard layout
+    lang_id = klid & 0xFFFF
+
+    return config.LANGUAGE_ID[str(lang_id)]
 
 
 # Function to run in the background and listen for keyboard events
 def background_task(cache):
 
+    # Keyboard listener
     def on_keypress(key):
+
+        # If the switcher is disabled, do nothing
+        if config.EnableSwitcher == False:
+            return
+
+        # Get current keyboard layout
+        current_keyboard_layout = get_keyboard_layout()
+
+        # if language is manually changed by keyboard, update the window titles
+        if windows.get_active_window_langage() != current_keyboard_layout:
+
+            if  config.SaveWindowState == True:
+                windows.set_active_window_langage(current_keyboard_layout)
+                config.LastSetting = windows.get_active_window_langage()
+
+
         if hasattr(key,'char') :
             cache.push_char(key.char)
         elif (key == keyboard.Key.space):
@@ -95,7 +121,7 @@ def background_task(cache):
             pass
             #print(f"Special key pressed: {key}")
 
-        if Constants.SEARCH:
+        if config.SEARCH:
 
             text = ''.join(cache.cache)
             text_variants = [Languages.convert_text_bidirectional(text, Languages.english_layout, Languages.russian_layout),
@@ -118,18 +144,18 @@ def background_task(cache):
                 if (detected_language != []):
 
                     language_id = str(get_keyboard_layout_info())
-                    # print("current layout was",Constants.LANGUAGE_ID[language_id])
+                    # print("current layout was",config.LANGUAGE_ID[language_id])
 
-                    if Constants.LANGUAGE_ID[language_id] != detected_language[0]:
+                    if config.LANGUAGE_ID[language_id] != detected_language[0]:
 
                         # Erase the cached string
                         for _ in range(len(cache)):
                             send_backspace()
 
                         # Change the keyboard layout to the new language
-                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(Constants.LANGUAGE_CODES[detected_language[0]])
+                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(config.LANGUAGE_CODES[detected_language[0]])
                         windows.set_active_window_langage(detected_language[0])
-                        Constants.LastSetting # Set the last setting to the new language
+                        config.LastSetting = detected_language[0] # Set the last setting to the new language
 
                         # Print on the screen the new language (the cache with the new language)
                         send_string(cache.cache)
@@ -138,30 +164,51 @@ def background_task(cache):
                     cache.clear()
 
                     # Disable the search functionality until next mouse click
-                    Constants.SEARCH = False # Disable the search functionality until next mouse click
+                    config.SEARCH = False # Disable the search functionality until next mouse click
 
     # Function to run when a mouse click is detected
     def on_click(x, y, button, pressed):
 
-        active_window_language = windows.get_active_window_langage()
-        if active_window_language is None:
-            active_window_language = Constants.LastSetting
+        # If the switcher is disabled, do nothing
+        if config.EnableSwitcher == False:
+            return
 
-        if pressed:
-            cache.clear()  # Clear the cache
+        if pressed: # If the mouse button is pressed
 
-            Constants.SEARCH = True  # Set the Language Change SEARCH flag to true
+            cache.clear()  # Clear the key cache
+            config.SEARCH = True  # Set the Language Change SEARCH flag to true
             #print(f"Mouse clicked at ({x}, {y}) with button {button}")
 
-        # Change the keyboard layout to the new language
-        # TODO: Check if the language was set manually or automatically
-        try:
-            py_win_keyboard_layout.change_foreground_window_keyboard_layout(Constants.LANGUAGE_CODES[active_window_language])
-            Constants.LastSetting = active_window_language # Set the last setting to the new language
-        except:
-            # unable to change keyboard layout properly
-            active_window_language = Constants.LastSetting
-            py_win_keyboard_layout.change_foreground_window_keyboard_layout(Constants.LANGUAGE_CODES[active_window_language])
+        # Get current keyboard layout
+        current_keyboard_layout = get_keyboard_layout()
+
+        # if language is manually changed, update the window language
+        if (windows.get_active_window_langage() != current_keyboard_layout) and (current_keyboard_layout != config.LastSetting):
+            # manual_setting = True
+            if config.SaveWindowState == True:
+                windows.set_active_window_langage(current_keyboard_layout)
+                config.LastSetting = current_keyboard_layout
+        else:
+            # manual_setting = False
+
+            if config.SaveWindowState == True:
+                # Check if the active window language is None (meaning no active window)
+                active_window_language = windows.get_active_window_langage()
+
+                if active_window_language is None:
+                    active_window_language = config.LastSetting
+
+                # Change the keyboard layout to the window language
+                try:
+                    py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                        config.LANGUAGE_CODES[active_window_language])
+                    config.LastSetting = active_window_language  # Set the last setting to the new language
+                except:
+                    # unable to change keyboard layout properly
+                    active_window_language = config.LastSetting
+                    py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                        config.LANGUAGE_CODES[active_window_language])
+
 
     # Create and start a keyboard and mouse listeners on start
     keyboard_listener = keyboard.Listener(on_press=on_keypress)
@@ -179,18 +226,35 @@ def create_system_tray_icon():
     image = Image.open("keyboard.ico")
 
     menu = pystray.Menu(
-        pystray.MenuItem('About', lambda icon, item: icon.notify('Keyboard Switcher v1.0!')),
-        pystray.MenuItem('Exit', on_tray_clicked)
+        #set radio button for search
+        pystray.MenuItem('Enable Switcher', enable_switcher, checked=lambda item: config.EnableSwitcher, radio=True),
+        pystray.MenuItem('Save window state', enable_window_state, checked=lambda item: config.SaveWindowState, radio=True, enabled=lambda item: config.EnableSwitcher),
+        pystray.MenuItem('About', tray_about),
+        pystray.Menu.SEPARATOR,  # Separator
+        pystray.MenuItem('Exit', on_tray_exit)
         )
     icon = pystray.Icon("KeyboardSwitcher", image, "Keyboard Switcher", menu)
     icon.run()
 
+# Enable/Disable the Application
+def enable_switcher(icon, item):
+    config.EnableSwitcher = not(config.EnableSwitcher)
+    # Disable menu item "Save window state" if the switcher is disable
 
+# Enable/Disable the window state saving
+def enable_window_state(icon, item):
+    config.SaveWindowState = not(config.SaveWindowState)
 
-# Function to run when the system tray icon is clicked
-def on_tray_clicked(icon, item):
+# Function to run when the system tray exit button is clicked
+def on_tray_exit(icon, item):
     if item.text == 'Exit':
         icon.stop()
+
+# Display "About" information in the system tray
+def tray_about(icon, item):
+    icon.notify('Click on text area and start typing','Keyboard Switcher v1.1')
+    time.sleep(3)
+    icon.remove_notification()
 
 
 # Send a backspace to the keyboard
