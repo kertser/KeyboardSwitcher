@@ -97,6 +97,27 @@ def background_task(cache):
         if config.EnableSwitcher == False:
             return
 
+        # Check if Alt+Tab has been pressed
+        if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r or key == keyboard.Key.alt_gr:
+            config.alt_pressed = True
+        elif config.alt_pressed and key == keyboard.Key.tab:
+            config.alt_pressed = False
+            # Initiate the on_click event
+
+            current_window = gw.getActiveWindow()
+
+            # Check if there's an active window
+            if current_window is not None:
+                # Bring the current window to the front and click
+
+                ##! Minor bug with window switching delay
+                #current_window.activate()
+                #time.sleep(0.1)  # Wait for the window to be activated
+                on_click(0, 0, 0, True) # Click the window
+
+            return
+
+
         # Get current keyboard layout
         current_keyboard_layout = get_keyboard_layout()
 
@@ -107,19 +128,19 @@ def background_task(cache):
                 windows.set_active_window_langage(current_keyboard_layout)
                 config.LastSetting = windows.get_active_window_langage()
 
-
-        if hasattr(key,'char') :
+        # If char key is pressed, add it to the cache
+        if hasattr(key,'char'):
             cache.push_char(key.char)
         elif (key == keyboard.Key.space):
             cache.push_char(' ')
         elif (key == keyboard.Key.enter):
             pass # placeholder
-        elif  key == keyboard.Key.backspace:
+        elif key == keyboard.Key.backspace:
             if  len(cache)>0:
                 cache.del_char()
         else: # Ignore other keys
             pass
-            #print(f"Special key pressed: {key}")
+            # print(f"Special key pressed: {key}")
 
         if config.SEARCH:
 
@@ -208,7 +229,6 @@ def background_task(cache):
                     active_window_language = config.LastSetting
                     py_win_keyboard_layout.change_foreground_window_keyboard_layout(
                         config.LANGUAGE_CODES[active_window_language])
-
 
     # Create and start a keyboard and mouse listeners on start
     keyboard_listener = keyboard.Listener(on_press=on_keypress)

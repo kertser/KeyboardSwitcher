@@ -15,3 +15,6 @@ LANGUAGE_ID = {
     '1049' : 'ru', # Russian
     '1037' : 'he' # Hebrew (Israel)
 }
+
+# Initialize the variable to track Alt key presses
+alt_pressed = False
