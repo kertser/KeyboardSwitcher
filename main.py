@@ -98,21 +98,24 @@ def background_task(cache):
             return
 
         # Check if Alt+Tab has been pressed
+        # First check for Alt key, then check for Tab key
+        # If Alt+Tab has been pressed, set the alt_pressed flag to True
+        # If the alt_pressed flag is True, and the Tab key is pressed,
+        # initiate the on_click event
+
         if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r or key == keyboard.Key.alt_gr:
             config.alt_pressed = True
         elif config.alt_pressed and key == keyboard.Key.tab:
             config.alt_pressed = False
             # Initiate the on_click event
-
             current_window = gw.getActiveWindow()
 
             # Check if there's an active window
             if current_window is not None:
                 # Bring the current window to the front and click
 
-                ##! Minor bug with window switching delay
-                #current_window.activate()
-                #time.sleep(0.1)  # Wait for the window to be activated
+                current_window.activate()
+                time.sleep(0.5)  # Wait for the window to be activated
                 on_click(0, 0, 0, True) # Click the window
 
             return
@@ -315,6 +318,7 @@ if __name__ == "__main__":
     # Start the background task in a separate thread
     bg_thread = threading.Thread(target=background_task(cache), daemon=True)
     bg_thread.start()
+
     print('Model is loaded and the background task is running')
 
     create_system_tray_icon()
