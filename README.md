@@ -35,7 +35,7 @@ git clone https://github.com/kertser/KeyboardSwitcher.git
 cd KeyboardSwitcher
 # pay attention to the unnecessary dependencies in requirements, 
 # needed for training the model only
-pip install requrements.txt
+pip install -r requrements.txt
 python3 main.py
 ```
 Alternatively, the software can be operated as Windows Program
