@@ -1,0 +1,7 @@
+#include <windows.h>
+#include "@CMAKE_CURRENT_SOURCE_DIR@/resources/resource.h"
+
+IDI_KEYBOARD_ICON ICON "@KEYBOARD_ICO_PATH@"
+
+
+
