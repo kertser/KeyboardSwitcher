@@ -144,8 +144,11 @@ static wchar_t VkToWchar(DWORD vkCode) {
     // the hook runs on our thread, not the foreground app's thread.
     // GetAsyncKeyState() queries the real physical key state.
     BYTE keyboardState[256] = {};
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+    bool shiftDown = false;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
         keyboardState[VK_SHIFT] = 0x80;
+        shiftDown = true;
+    }
     if (GetAsyncKeyState(VK_LSHIFT) & 0x8000)
         keyboardState[VK_LSHIFT] = 0x80;
     if (GetAsyncKeyState(VK_RSHIFT) & 0x8000)
@@ -162,9 +165,31 @@ static wchar_t VkToWchar(DWORD vkCode) {
     HWND hwnd = GetForegroundWindow();
     DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
     HKL hkl = ::GetKeyboardLayout(threadId);
-    int result = ToUnicodeEx(vkCode, MapVirtualKeyEx(vkCode, MAPVK_VK_TO_VSC, hkl),
-                             keyboardState, buffer, 4, 0, hkl);
-    if (result > 0) return buffer[0];
+    UINT scanCode = MapVirtualKeyEx(vkCode, MAPVK_VK_TO_VSC, hkl);
+    int result = ToUnicodeEx(vkCode, scanCode, keyboardState, buffer, 4, 0, hkl);
+
+    if (result > 0) {
+        wchar_t ch = buffer[0];
+
+        // On non-Latin layouts (Hebrew, Russian, etc.) pressing Shift can
+        // produce a Latin letter (e.g. Shift+Z on Hebrew → 'Z' instead of 'ז').
+        // Detect this and retry without Shift to get the correct character.
+        if (shiftDown && ch >= L'A' && ch <= L'Z') {
+            LANGID langId = LOWORD((DWORD_PTR)hkl);
+            std::string lang = Config::GetLanguageFromId(langId);
+            if (lang != "en") {
+                // Retry without Shift
+                BYTE noShiftState[256] = {};
+                if (GetKeyState(VK_CAPITAL) & 0x0001)
+                    noShiftState[VK_CAPITAL] = 0x01;
+                wchar_t buffer2[4] = {};
+                int result2 = ToUnicodeEx(vkCode, scanCode, noShiftState, buffer2, 4, 0, hkl);
+                if (result2 > 0)
+                    return buffer2[0];
+            }
+        }
+        return ch;
+    }
     return 0;
 }
 
@@ -235,17 +260,21 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     }
 
     // --- Handle character input ---
+    bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool capsOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+    bool isUpperIntent = shiftHeld ^ capsOn; // XOR: Shift flips CapsLock
+
     if (vk == VK_BACK) {
         g_cache.DelChar();
     } else if (vk == VK_SPACE) {
-        g_cache.PushChar(L' ');
+        g_cache.PushChar(L' ', false);
     } else if (vk == VK_RETURN) {
         // Enter: placeholder (same as Python version)
     } else if ((vk >= 0x30 && vk <= 0x5A) || (vk >= VK_OEM_1 && vk <= VK_OEM_3) ||
                (vk >= VK_OEM_4 && vk <= VK_OEM_8)) {
         wchar_t ch = VkToWchar(vk);
         if (ch != 0) {
-            g_cache.PushChar(ch);
+            g_cache.PushChar(ch, isUpperIntent);
         }
     }
 
@@ -319,12 +348,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         Layouts::GetLayoutForLanguage(detected)
                     );
 
-                    // Preserve first-letter capitalization: if the first
-                    // character the user typed was uppercase, make sure the
+                    // Preserve first-letter capitalization: if Shift was held
+                    // when the first character was typed, make sure the
                     // corrected text also starts with an uppercase letter.
-                    if (!cacheChars.empty() && !correctedText.empty() &&
-                        iswupper(cacheChars[0]) && iswlower(correctedText[0])) {
-                        correctedText[0] = towupper(correctedText[0]);
+                    // Use CharUpperW (Win32 API) instead of towupper because
+                    // the CRT towupper may not handle Cyrillic in the C locale.
+                    if (g_cache.WasFirstCharShifted() && !correctedText.empty()) {
+                        wchar_t buf[2] = { correctedText[0], L'\0' };
+                        CharUpperW(buf);
+                        correctedText[0] = buf[0];
                     }
 
                     g_isSendingInput.store(true);
