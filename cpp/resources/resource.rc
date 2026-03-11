@@ -1,0 +1,4 @@
+#include "resource.h"
+#include <windows.h>
+
+IDI_KEYBOARD_ICON ICON "keyboard.ico"
