@@ -17,6 +17,9 @@ namespace Config {
     // Minimum number of characters typed before language detection triggers
     extern std::atomic<int> MinCharsBeforeDetection;
 
+    // Minimum softmax confidence to trigger a switch (0.0 - 1.0)
+    extern float MinConfidence;
+
     // Language codes for ActivateKeyboardLayout / PostMessage
     extern const std::unordered_map<std::string, HKL> LANGUAGE_CODES;
 

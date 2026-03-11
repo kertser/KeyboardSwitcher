@@ -139,8 +139,25 @@ static void SendString(const std::vector<wchar_t>& chars) {
 // Helper: translate a virtual key to a wide character
 // ============================================================
 static wchar_t VkToWchar(DWORD vkCode) {
+    // Build keyboard state from the actual hardware key states.
+    // GetKeyboardState() does NOT work in a low-level hook because
+    // the hook runs on our thread, not the foreground app's thread.
+    // GetAsyncKeyState() queries the real physical key state.
     BYTE keyboardState[256] = {};
-    if (!GetKeyboardState(keyboardState)) return 0;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        keyboardState[VK_SHIFT] = 0x80;
+    if (GetAsyncKeyState(VK_LSHIFT) & 0x8000)
+        keyboardState[VK_LSHIFT] = 0x80;
+    if (GetAsyncKeyState(VK_RSHIFT) & 0x8000)
+        keyboardState[VK_RSHIFT] = 0x80;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        keyboardState[VK_CONTROL] = 0x80;
+    if (GetAsyncKeyState(VK_MENU) & 0x8000)
+        keyboardState[VK_MENU] = 0x80;
+    // CapsLock toggle state is in the low bit
+    if (GetKeyState(VK_CAPITAL) & 0x0001)
+        keyboardState[VK_CAPITAL] = 0x01;
+
     wchar_t buffer[4] = {};
     HWND hwnd = GetForegroundWindow();
     DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
@@ -236,88 +253,112 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (Config::SEARCH.load() && g_cache.Size() > static_cast<size_t>(Config::MinCharsBeforeDetection.load()) && g_detector) {
         std::wstring text = g_cache.GetText();
 
-        // Generate all 6 layout conversion variants (same as Python)
-        std::vector<std::wstring> textVariants = {
-            ConvertTextBidirectional(text, Layouts::english_layout, Layouts::russian_layout),
-            ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::english_layout),
-            ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::english_layout),
-            ConvertTextBidirectional(text, Layouts::english_layout, Layouts::hebrew_layout),
-            ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::hebrew_layout),
-            ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::russian_layout),
-        };
-
-        // Deduplicate
-        std::set<std::wstring> uniqueSet(textVariants.begin(), textVariants.end());
-        textVariants.assign(uniqueSet.begin(), uniqueSet.end());
-
-        // Run prediction on each variant
-        std::vector<std::string> detectedLanguages;
-        for (const auto& variant : textVariants) {
-            auto lang = g_detector->PredictLanguage(variant);
-            if (lang.has_value()) {
-                detectedLanguages.push_back(lang.value());
+        // Edge-case filter: skip detection for URLs, paths, mostly non-alpha
+        bool shouldSkip = false;
+        if (text.find(L"://") != std::wstring::npos ||
+            text.find(L"www.") != std::wstring::npos ||
+            text.find(L"http") != std::wstring::npos) {
+            shouldSkip = true;
+        }
+        if (text.size() > 2 && text[1] == L':' && (text[2] == L'\\' || text[2] == L'/')) {
+            shouldSkip = true;
+        }
+        {
+            size_t alphaCount = 0;
+            for (wchar_t c : text) {
+                if (iswalpha(c)) ++alphaCount;
             }
+            if (alphaCount < text.size() / 2) shouldSkip = true;
         }
 
-        if (!detectedLanguages.empty()) {
-            std::string currentLangId = GetCurrentKeyboardLayout();
-            std::string detected = detectedLanguages[0];
-            bool didCorrection = false;
+        if (!shouldSkip) {
+            // Generate all 6 layout conversion variants (same order as Python)
+            std::vector<std::wstring> textVariants = {
+                ConvertTextBidirectional(text, Layouts::english_layout, Layouts::russian_layout),
+                ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::english_layout),
+                ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::english_layout),
+                ConvertTextBidirectional(text, Layouts::english_layout, Layouts::hebrew_layout),
+                ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::hebrew_layout),
+                ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::russian_layout),
+            };
 
-            if (currentLangId != detected) {
-                size_t cacheLen = g_cache.Size();
-                auto cacheChars = g_cache.GetCache();
-
-                // Convert cached text to the detected language
-                std::wstring cachedText(cacheChars.begin(), cacheChars.end());
-                std::wstring correctedText = ConvertTextBidirectional(
-                    cachedText,
-                    (currentLangId == "en") ? Layouts::english_layout :
-                    (currentLangId == "ru") ? Layouts::russian_layout : Layouts::hebrew_layout,
-                    (detected == "en") ? Layouts::english_layout :
-                    (detected == "ru") ? Layouts::russian_layout : Layouts::hebrew_layout
-                );
-
-                g_isSendingInput.store(true);
-
-                // In a low-level hook the current keystroke has NOT been
-                // delivered to the application yet.  Characters 1..(N-1)
-                // are already on screen; character N (the one that
-                // triggered this detection) will be delivered only when
-                // we return from this hook.
-                //
-                // Erase the (N-1) characters that are already on screen.
-                if (cacheLen > 1)
-                    SendBackspaces(cacheLen - 1);
-
-                // Change keyboard layout to the detected language
-                ChangeKeyboardLayout(detected);
-                if (g_windows) {
-                    g_windows->SetActiveWindowLanguage(detected);
+            // Deduplicate (preserving first occurrence order, like Python's set)
+            {
+                std::vector<std::wstring> unique;
+                std::set<std::wstring> seen;
+                for (auto& v : textVariants) {
+                    if (seen.insert(v).second)
+                        unique.push_back(std::move(v));
                 }
-                Config::LastSetting = detected;
-
-                Sleep(50);
-
-                // Re-type the full corrected text (all N characters)
-                std::vector<wchar_t> correctedChars(correctedText.begin(), correctedText.end());
-                SendString(correctedChars);
-
-                g_isSendingInput.store(false);
-                didCorrection = true;
+                textVariants = std::move(unique);
             }
 
-            // Clear cache and disable search until next mouse click
-            g_cache.Clear();
-            Config::SEARCH.store(false);
-
-            if (didCorrection) {
-                // Block the current keystroke – we already re-typed it
-                // in the corrected form above, so it must not be
-                // delivered again by the system.
-                return 1;
+            // Run prediction on each variant, collect non-null results
+            std::vector<std::string> detectedLanguages;
+            for (const auto& variant : textVariants) {
+                auto lang = g_detector->PredictLanguage(variant);
+                if (lang.has_value()) {
+                    detectedLanguages.push_back(lang.value());
+                }
             }
-            // No correction needed – let the keystroke through normally
+
+            if (!detectedLanguages.empty()) {
+                std::string currentLangId = GetCurrentKeyboardLayout();
+                std::string detected = detectedLanguages[0];
+                bool didCorrection = false;
+
+                if (currentLangId != detected) {
+                    size_t cacheLen = g_cache.Size();
+                    auto cacheChars = g_cache.GetCache();
+
+                    // Convert cached text to the detected language
+                    std::wstring cachedText(cacheChars.begin(), cacheChars.end());
+                    std::wstring correctedText = ConvertTextBidirectional(
+                        cachedText,
+                        Layouts::GetLayoutForLanguage(currentLangId),
+                        Layouts::GetLayoutForLanguage(detected)
+                    );
+
+                    // Preserve first-letter capitalization: if the first
+                    // character the user typed was uppercase, make sure the
+                    // corrected text also starts with an uppercase letter.
+                    if (!cacheChars.empty() && !correctedText.empty() &&
+                        iswupper(cacheChars[0]) && iswlower(correctedText[0])) {
+                        correctedText[0] = towupper(correctedText[0]);
+                    }
+
+                    g_isSendingInput.store(true);
+
+                    // Current keystroke not delivered yet; erase N-1 on screen
+                    if (cacheLen > 1)
+                        SendBackspaces(cacheLen - 1);
+
+                    // Change keyboard layout to the detected language
+                    ChangeKeyboardLayout(detected);
+                    if (g_windows) {
+                        g_windows->SetActiveWindowLanguage(detected);
+                    }
+                    Config::LastSetting = detected;
+
+                    Sleep(50);
+
+                    // Re-type the full corrected text
+                    std::vector<wchar_t> correctedChars(correctedText.begin(), correctedText.end());
+                    SendString(correctedChars);
+
+                    g_isSendingInput.store(false);
+                    didCorrection = true;
+                }
+
+                // Clear cache and disable search until next mouse click
+                // (matches Python: one-shot detection per click)
+                g_cache.Clear();
+                Config::SEARCH.store(false);
+
+                if (didCorrection) {
+                    return 1; // Block the current keystroke
+                }
+            }
         }
     }
 

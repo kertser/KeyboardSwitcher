@@ -6,6 +6,13 @@
 #include <optional>
 #include <memory>
 
+// Result of a single language prediction with confidence scores
+struct DetectionResult {
+    std::string language;   // "en", "he", "ru", or "" for N/A
+    float confidence;       // softmax probability of the top class
+    float scores[4];        // raw softmax probabilities [N/A, en, he, ru]
+};
+
 class LanguageDetector {
 public:
     LanguageDetector();
@@ -16,6 +23,9 @@ public:
 
     // Predict language from text. Returns "en", "he", "ru", or nullopt
     std::optional<std::string> PredictLanguage(const std::wstring& text);
+
+    // Predict with full confidence information
+    std::optional<DetectionResult> PredictLanguageWithConfidence(const std::wstring& text);
 
 private:
     struct Impl;
@@ -28,6 +38,9 @@ namespace Layouts {
     extern const std::wstring russian_layout;
     extern const std::wstring english_layout;
     extern const std::wstring hebrew_layout;
+
+    // Get layout string for a language code
+    const std::wstring& GetLayoutForLanguage(const std::string& lang);
 }
 
 // Create a conversion map from source to target layout

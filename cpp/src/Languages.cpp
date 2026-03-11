@@ -33,6 +33,12 @@ namespace Layouts {
         L";/'\u05e7\u05e8\u05d0\u05d8\u05d5\u05df\u05dd\u05e4]"
         L"[\u05e9\u05d3\u05d2\u05db\u05e2\u05d9\u05d7\u05dc\u05da\u05e3,"
         L"\\\u05d6\u05e1\u05d1\u05d4\u05e0\u05de\u05e6\u05ea\u05e5.";
+
+    const std::wstring& GetLayoutForLanguage(const std::string& lang) {
+        if (lang == "ru") return russian_layout;
+        if (lang == "he") return hebrew_layout;
+        return english_layout;
+    }
 }
 
 // ============================================================
@@ -207,6 +213,92 @@ std::optional<std::string> LanguageDetector::PredictLanguage(const std::wstring&
             case 3: return "ru";
             default: return std::nullopt;
         }
+    }
+    catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+static std::string ClassToLanguage(int cls) {
+    switch (cls) {
+        case 1: return "en";
+        case 2: return "he";
+        case 3: return "ru";
+        default: return "";
+    }
+}
+
+std::optional<DetectionResult> LanguageDetector::PredictLanguageWithConfidence(const std::wstring& text) {
+    if (!pImpl->session) return std::nullopt;
+
+    try {
+        // Tokenize: convert characters to indices
+        std::vector<int64_t> inputIndices;
+        inputIndices.reserve(MAX_LENGTH);
+
+        for (wchar_t ch : text) {
+            auto it = pImpl->charToIndex.find(ch);
+            if (it != pImpl->charToIndex.end()) {
+                inputIndices.push_back(it->second);
+            }
+        }
+
+        while (static_cast<int>(inputIndices.size()) < MAX_LENGTH)
+            inputIndices.push_back(0);
+        if (static_cast<int>(inputIndices.size()) > MAX_LENGTH)
+            inputIndices.resize(MAX_LENGTH);
+
+        std::array<int64_t, 2> inputShape = {1, MAX_LENGTH};
+        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value inputTensor = Ort::Value::CreateTensor<int64_t>(
+            memoryInfo, inputIndices.data(), inputIndices.size(),
+            inputShape.data(), inputShape.size());
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto inputNamePtr = pImpl->session->GetInputNameAllocated(0, allocator);
+        auto outputNamePtr = pImpl->session->GetOutputNameAllocated(0, allocator);
+
+        const char* inputNames[] = {inputNamePtr.get()};
+        const char* outputNames[] = {outputNamePtr.get()};
+
+        auto outputTensors = pImpl->session->Run(
+            Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
+
+        float* outputData = outputTensors[0].GetTensorMutableData<float>();
+        auto outputInfo = outputTensors[0].GetTensorTypeAndShapeInfo();
+        size_t outputSize = outputInfo.GetElementCount();
+        if (outputSize < 4) return std::nullopt;
+
+        // Softmax
+        float maxLogit = *std::max_element(outputData, outputData + outputSize);
+        float sumExp = 0.0f;
+        DetectionResult result = {};
+        for (size_t i = 0; i < 4; ++i) {
+            result.scores[i] = std::exp(outputData[i] - maxLogit);
+            sumExp += result.scores[i];
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            result.scores[i] /= sumExp;
+        }
+
+        // Argmax (skip class 0 = N/A)
+        int bestClass = 0;
+        float bestProb = 0.0f;
+        for (int i = 1; i < 4; ++i) {
+            if (result.scores[i] > bestProb) {
+                bestProb = result.scores[i];
+                bestClass = i;
+            }
+        }
+
+        // If N/A has the highest probability, return nullopt
+        if (result.scores[0] > bestProb) return std::nullopt;
+
+        result.language = ClassToLanguage(bestClass);
+        result.confidence = bestProb;
+
+        if (result.language.empty()) return std::nullopt;
+        return result;
     }
     catch (const std::exception&) {
         return std::nullopt;
