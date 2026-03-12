@@ -19,6 +19,9 @@ public:
     // Show a balloon notification
     void ShowBalloon(const std::wstring& title, const std::wstring& message);
 
+    // Update the hover tooltip text
+    void UpdateTooltip(const std::wstring& text);
+
 private:
     NOTIFYICONDATAW nid_ = {};
     bool created_ = false;

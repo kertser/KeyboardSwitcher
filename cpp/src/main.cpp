@@ -63,6 +63,24 @@ static std::string GetCurrentKeyboardLayout() {
 }
 
 // ============================================================
+// Helper: human-readable language name for tooltip display
+// ============================================================
+static std::wstring GetLanguageDisplayName(const std::string& lang) {
+    if (lang == "en") return L"English";
+    if (lang == "ru") return L"\x0420\x0443\x0441\x0441\x043A\x0438\x0439";  // Русский
+    if (lang == "he") return L"\x05E2\x05D1\x05E8\x05D9\x05EA";              // עברית
+    return L"Unknown";
+}
+
+// ============================================================
+// Helper: update tray tooltip to reflect current layout
+// ============================================================
+static void UpdateTrayTooltip() {
+    std::string lang = GetCurrentKeyboardLayout();
+    g_trayIcon.UpdateTooltip(L"Keyboard Switcher \x2014 " + GetLanguageDisplayName(lang));
+}
+
+// ============================================================
 // Helper: find the actual installed HKL for a language
 // ============================================================
 static HKL FindInstalledHKL(const std::string& lang) {
@@ -240,6 +258,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             }
             g_cache.Clear();
             Config::SEARCH.store(true);
+            UpdateTrayTooltip();
         }).detach();
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
     }
@@ -261,6 +280,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             // Manual switch detected → stop auto-detection until next click
             g_cache.Clear();
             Config::SEARCH.store(false);
+            UpdateTrayTooltip();
         }
     }
 
@@ -396,6 +416,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                     g_isSendingInput.store(false);
                     didCorrection = true;
+                    UpdateTrayTooltip();
                 }
 
                 // Clear cache and disable search until next mouse click
@@ -437,6 +458,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
                 Config::LastSetting = windowLang;
             }
         }
+        UpdateTrayTooltip();
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -483,7 +505,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             Config::SaveWindowState.store(!Config::SaveWindowState.load());
             break;
         case ID_TRAY_ABOUT:
-            g_trayIcon.ShowBalloon(L"Keyboard Switcher v1.1",
+            g_trayIcon.ShowBalloon((std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
                                    L"Click on text area and start typing");
             break;
         case ID_TRAY_EXIT:
@@ -558,6 +580,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
     g_trayIcon.Create(g_hwndHidden, hIcon);
+    UpdateTrayTooltip();
 
     // Periodic cleanup of stale window entries (every 60 seconds)
     SetTimer(g_hwndHidden, 1, 60000, nullptr);

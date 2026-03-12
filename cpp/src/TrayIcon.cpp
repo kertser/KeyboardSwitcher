@@ -36,3 +36,10 @@ void TrayIcon::ShowBalloon(const std::wstring& title, const std::wstring& messag
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
 
+void TrayIcon::UpdateTooltip(const std::wstring& text) {
+    if (!created_) return;
+    nid_.uFlags = NIF_TIP;
+    StringCchCopyW(nid_.szTip, ARRAYSIZE(nid_.szTip), text.c_str());
+    Shell_NotifyIconW(NIM_MODIFY, &nid_);
+}
+

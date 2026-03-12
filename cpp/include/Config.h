@@ -7,6 +7,9 @@
 
 namespace Config {
 
+    // Application version
+    constexpr const wchar_t* VERSION = L"1.2.0";
+
     // Global flags (atomic for thread safety)
     extern std::atomic<bool> EnableSwitcher;
     extern std::atomic<bool> SEARCH;
