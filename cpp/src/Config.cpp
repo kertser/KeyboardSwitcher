@@ -8,11 +8,24 @@ namespace Config {
     std::atomic<bool> alt_pressed{false};
     std::string LastSetting = "en";
 
-    // Minimum characters before detection (detection fires when cache size > this value)
-    std::atomic<int> MinCharsBeforeDetection{5};
+    // ── Adaptive confidence curve parameters ──
+    int   EarlyDetectionMinChars = 3;      // earliest detection fires here
+    int   FullConfidenceChars    = 10;     // confidence floor kicks in here
+    float ConfidenceAtMinChars   = 0.97f;  // near-certainty at few chars
+    float ConfidenceAtMaxChars   = 0.55f;  // relaxed after enough chars
 
-    // Minimum softmax confidence to trigger a language switch
-    float MinConfidence = 0.6f;
+    float GetRequiredConfidence(size_t numChars) {
+        int n = static_cast<int>(numChars);
+        if (n < EarlyDetectionMinChars)
+            return 1.1f;                       // impossible → no detection
+        if (n >= FullConfidenceChars)
+            return ConfidenceAtMaxChars;        // floor
+
+        // Linear interpolation
+        float t = static_cast<float>(n - EarlyDetectionMinChars)
+                / static_cast<float>(FullConfidenceChars - EarlyDetectionMinChars);
+        return ConfidenceAtMinChars + t * (ConfidenceAtMaxChars - ConfidenceAtMinChars);
+    }
 
     // Language codes: HKL values matching the Python project
     const std::unordered_map<std::string, HKL> LANGUAGE_CODES = {

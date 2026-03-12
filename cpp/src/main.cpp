@@ -283,8 +283,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
     }
 
-    // --- Language detection ---
-    if (Config::SEARCH.load() && g_cache.Size() > static_cast<size_t>(Config::MinCharsBeforeDetection.load()) && g_detector) {
+    // --- Language detection (adaptive confidence) ---
+    size_t cacheSize = g_cache.Size();
+    if (Config::SEARCH.load() &&
+        cacheSize >= static_cast<size_t>(Config::EarlyDetectionMinChars) &&
+        g_detector)
+    {
+        // Compute the confidence bar for the current text length.
+        // Short text → very high bar; longer text → lower bar.
+        float requiredConfidence = Config::GetRequiredConfidence(cacheSize);
+
         std::wstring text = g_cache.GetText();
 
         // Edge-case filter: skip detection for URLs, paths, mostly non-alpha
@@ -316,7 +324,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::russian_layout),
             };
 
-            // Deduplicate (preserving first occurrence order, like Python's set)
+            // Deduplicate (preserving first occurrence order)
             {
                 std::vector<std::wstring> unique;
                 std::set<std::wstring> seen;
@@ -327,21 +335,28 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 textVariants = std::move(unique);
             }
 
-            // Run prediction on each variant, collect non-null results
-            std::vector<std::string> detectedLanguages;
+            // Run prediction WITH CONFIDENCE on each variant.
+            // Pick the variant whose predicted language has the highest
+            // softmax probability – that is the most likely interpretation.
+            std::string bestLang;
+            float       bestConf = 0.0f;
+
             for (const auto& variant : textVariants) {
-                auto lang = g_detector->PredictLanguage(variant);
-                if (lang.has_value()) {
-                    detectedLanguages.push_back(lang.value());
+                auto result = g_detector->PredictLanguageWithConfidence(variant);
+                if (result.has_value() && result->confidence > bestConf) {
+                    bestConf = result->confidence;
+                    bestLang = result->language;
                 }
             }
 
-            if (!detectedLanguages.empty()) {
+            // Act only when confidence meets the adaptive threshold.
+            // If the bar is not met we keep accumulating characters –
+            // the next keystroke will lower the bar and try again.
+            if (!bestLang.empty() && bestConf >= requiredConfidence) {
                 std::string currentLangId = GetCurrentKeyboardLayout();
-                std::string detected = detectedLanguages[0];
                 bool didCorrection = false;
 
-                if (currentLangId != detected) {
+                if (currentLangId != bestLang) {
                     size_t cacheLen = g_cache.Size();
                     auto cacheChars = g_cache.GetCache();
 
@@ -350,14 +365,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     std::wstring correctedText = ConvertTextBidirectional(
                         cachedText,
                         Layouts::GetLayoutForLanguage(currentLangId),
-                        Layouts::GetLayoutForLanguage(detected)
+                        Layouts::GetLayoutForLanguage(bestLang)
                     );
 
-                    // Preserve first-letter capitalization: if Shift was held
-                    // when the first character was typed, make sure the
-                    // corrected text also starts with an uppercase letter.
-                    // Use CharUpperW (Win32 API) instead of towupper because
-                    // the CRT towupper may not handle Cyrillic in the C locale.
+                    // Preserve first-letter capitalization
                     if (g_cache.WasFirstCharShifted() && !correctedText.empty()) {
                         wchar_t buf[2] = { correctedText[0], L'\0' };
                         CharUpperW(buf);
@@ -371,11 +382,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         SendBackspaces(cacheLen - 1);
 
                     // Change keyboard layout to the detected language
-                    ChangeKeyboardLayout(detected);
+                    ChangeKeyboardLayout(bestLang);
                     if (g_windows) {
-                        g_windows->SetActiveWindowLanguage(detected);
+                        g_windows->SetActiveWindowLanguage(bestLang);
                     }
-                    Config::LastSetting = detected;
+                    Config::LastSetting = bestLang;
 
                     Sleep(50);
 
@@ -388,7 +399,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 }
 
                 // Clear cache and disable search until next mouse click
-                // (matches Python: one-shot detection per click)
                 g_cache.Clear();
                 Config::SEARCH.store(false);
 

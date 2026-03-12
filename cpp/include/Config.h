@@ -14,11 +14,22 @@ namespace Config {
     extern std::atomic<bool> alt_pressed;
     extern std::string LastSetting;
 
-    // Minimum number of characters typed before language detection triggers
-    extern std::atomic<int> MinCharsBeforeDetection;
+    // ── Adaptive confidence curve ──
+    // Detection starts at EarlyDetectionMinChars but requires very high
+    // confidence.  As the user types more characters the required confidence
+    // drops linearly until FullConfidenceChars, after which the floor applies.
+    //
+    //  chars < EarlyDetectionMinChars  → never detect
+    //  chars = EarlyDetectionMinChars  → require ConfidenceAtMinChars  (0.97)
+    //  chars = FullConfidenceChars     → require ConfidenceAtMaxChars  (0.55)
+    //  chars > FullConfidenceChars     → require ConfidenceAtMaxChars  (floor)
+    extern int   EarlyDetectionMinChars;   // default: 3
+    extern int   FullConfidenceChars;      // default: 10
+    extern float ConfidenceAtMinChars;     // default: 0.97
+    extern float ConfidenceAtMaxChars;     // default: 0.55
 
-    // Minimum softmax confidence to trigger a switch (0.0 - 1.0)
-    extern float MinConfidence;
+    // Compute the required softmax confidence for a given number of typed chars.
+    float GetRequiredConfidence(size_t numChars);
 
     // Language codes for ActivateKeyboardLayout / PostMessage
     extern const std::unordered_map<std::string, HKL> LANGUAGE_CODES;
