@@ -1,329 +1,470 @@
+# KeyboardSwitcher – Python implementation (synced with C++ v1.2.0)
+#
 # Importing the necessary packages
-import keyboard
 import threading
 import pystray
 import Languages
-from Languages import convert_text_bidirectional
+from Languages import convert_text_bidirectional, get_layout_for_language
 from PIL import Image
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import py_win_keyboard_layout
 from pynput import keyboard, mouse
-import ctypes # for keyboard layout codes
+import ctypes
 import sys
-import config # project constants and settings
+import config
 import time
 import warnings
-import pygetwindow as gw # window title search
+import pygetwindow as gw
 
 # Ignore all warnings:
 warnings.filterwarnings("ignore")
 
-# Class to hold the keyboard layout
-@dataclass
-class InputCache():
-    def __init__(self):
-        self.cache = []
+# ============================================================
+# Global tray icon reference (for tooltip updates)
+# ============================================================
+g_tray_icon = None
 
-    def push_char(self, char:str):
+
+# ============================================================
+# InputCache – tracks typed characters and shift state
+# (mirrors C++ InputCache with shift tracking)
+# ============================================================
+@dataclass
+class InputCache:
+    cache: list = field(default_factory=list)
+    shift_state: list = field(default_factory=list)
+
+    def push_char(self, char: str, shift_held: bool = False):
         self.cache.append(char)
+        self.shift_state.append(shift_held)
 
     def del_char(self):
-        if len(self.cache) == 0:
-            return None
-        return self.cache[:-1]
+        if len(self.cache) > 0:
+            self.cache.pop()
+            self.shift_state.pop()
 
     def clear(self):
         self.cache.clear()
+        self.shift_state.clear()
 
     def __len__(self):
         return len(self.cache)
 
-    def checkLang(self):
-        pass
+    def get_text(self) -> str:
+        return ''.join(self.cache)
 
+    def get_cache(self) -> list:
+        return list(self.cache)
+
+    def was_first_char_shifted(self) -> bool:
+        """Returns True if Shift was held when the first character was typed."""
+        if not self.shift_state:
+            return False
+        return self.shift_state[0]
+
+
+# ============================================================
+# OpenWindows – per-window language tracker
+# (mirrors C++ WindowTracker)
+# ============================================================
 @dataclass
-class OpenWindows():
+class OpenWindows:
 
-    # Initialize the list of open windows
-    def __init__(self,language):
-
-        # Dictionary to hold the window title and the language setup
+    def __init__(self, language):
         self.windows_language = {}
         available_windows = gw.getAllTitles()
         for window in available_windows:
             self.windows_language[window] = config.LANGUAGE_ID[language]
-            # print(f"Window: {window} Language: {self.windows_language[window]}")
 
-    # Get the language setup for the active window
     def get_active_window_langage(self):
-        # Get the active window title
         try:
             return self.windows_language[gw.getActiveWindowTitle()]
-        except:
-            # No active window title found
+        except Exception:
             return None
 
-    # Set the language for the active window
-    def set_active_window_langage(self,language):
-        self.windows_language[gw.getActiveWindowTitle()] = language
+    def set_active_window_langage(self, language):
+        try:
+            self.windows_language[gw.getActiveWindowTitle()] = language
+        except Exception:
+            pass
 
-    # update windows
+    def cleanup(self):
+        """Remove entries for windows that no longer exist (like C++ Cleanup)."""
+        available_windows = set(gw.getAllTitles())
+        self.windows_language = {
+            w: lang for w, lang in self.windows_language.items()
+            if w in available_windows
+        }
+
+    # Keep backward-compatible alias
     def update_window_titles(self):
-        available_windows = gw.getAllTitles()
-        updated_windows_language = {}
-        for window in available_windows:
-            if window in self.windows_language.keys():
-                updated_windows_language[window] = self.windows_language[window]
-        self.windows_language = updated_windows_language
+        self.cleanup()
 
+
+# ============================================================
+# Helper: get current keyboard layout as language string
+# ============================================================
 def get_keyboard_layout():
-    # Get the keyboard layout for windows
     hwnd = ctypes.windll.user32.GetForegroundWindow()
-    klid = ctypes.windll.user32.GetKeyboardLayout(ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0))
-
-    # Extract the language ID from the keyboard layout
+    klid = ctypes.windll.user32.GetKeyboardLayout(
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0))
     lang_id = klid & 0xFFFF
+    return config.LANGUAGE_ID.get(str(lang_id), 'en')
 
-    return config.LANGUAGE_ID[str(lang_id)]
+
+def get_keyboard_layout_info():
+    return py_win_keyboard_layout.get_foreground_window_keyboard_layout() & 0xFFFF
 
 
-# Function to run in the background and listen for keyboard events
+# ============================================================
+# Helper: update tray tooltip to show current language
+# ============================================================
+def update_tray_tooltip():
+    global g_tray_icon
+    if g_tray_icon is not None:
+        lang = get_keyboard_layout()
+        display = config.get_language_display_name(lang)
+        try:
+            g_tray_icon.title = f"Keyboard Switcher \u2014 {display}"
+        except Exception:
+            pass
+
+
+# ============================================================
+# Edge-case filter: skip detection for URLs, paths, mostly non-alpha
+# (mirrors C++ filtering logic)
+# ============================================================
+def should_skip_detection(text: str) -> bool:
+    if '://' in text or 'www.' in text or 'http' in text:
+        return True
+    if len(text) > 2 and text[1] == ':' and text[2] in ('\\', '/'):
+        return True
+    alpha_count = sum(1 for c in text if c.isalpha())
+    if alpha_count < len(text) / 2:
+        return True
+    return False
+
+
+# ============================================================
+# Order-preserving deduplication
+# (mirrors C++ seen-set approach instead of set())
+# ============================================================
+def deduplicate_ordered(items):
+    seen = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+# ============================================================
+# Send a backspace keystroke
+# ============================================================
+def send_backspace():
+    keyboard_controller = keyboard.Controller()
+    keyboard_controller.press(keyboard.Key.backspace)
+    keyboard_controller.release(keyboard.Key.backspace)
+    time.sleep(0.005)
+
+
+# ============================================================
+# Send a string character by character
+# ============================================================
+def send_string(chars):
+    keyboard_controller = keyboard.Controller()
+    for char in chars:
+        keyboard_controller.press(char)
+        keyboard_controller.release(char)
+        time.sleep(0.005)
+
+
+# ============================================================
+# Background task: keyboard & mouse hooks
+# ============================================================
 def background_task(cache):
 
-    # Keyboard listener
+    # Track shift state via pynput modifier events
+    shift_held = False
+
     def on_keypress(key):
+        nonlocal shift_held
 
-        # If the switcher is disabled, do nothing
-        if config.EnableSwitcher == False:
+        if not config.EnableSwitcher:
             return
 
-        # Check if Alt+Tab has been pressed
-        # First check for Alt key, then check for Tab key
-        # If Alt+Tab has been pressed, set the alt_pressed flag to True
-        # If the alt_pressed flag is True, and the Tab key is pressed,
-        # initiate the on_click event
+        # --- Track Shift state ---
+        if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            shift_held = True
 
-        if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r or key == keyboard.Key.alt_gr:
+        # --- Alt+Tab detection (mirrors C++ Alt+Tab handler) ---
+        if key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
             config.alt_pressed = True
-        elif config.alt_pressed and key == keyboard.Key.tab:
-            config.alt_pressed = False
-            # Initiate the on_click event
-            current_window = gw.getActiveWindow()
-
-            # Check if there's an active window
-            if current_window is not None:
-                # Bring the current window to the front and click
-
-                current_window.activate()
-                time.sleep(0.5)  # Wait for the window to be activated
-                on_click(0, 0, 0, True) # Click the window
-
             return
 
+        if config.alt_pressed and key == keyboard.Key.tab:
+            config.alt_pressed = False
 
-        # Get current keyboard layout
+            def alt_tab_handler():
+                time.sleep(0.5)
+                current_layout = get_keyboard_layout()
+                if config.SaveWindowState:
+                    window_lang = windows.get_active_window_langage()
+                    if window_lang != current_layout and current_layout != config.LastSetting:
+                        windows.set_active_window_langage(current_layout)
+                        config.LastSetting = current_layout
+                    else:
+                        if window_lang is None:
+                            window_lang = config.LastSetting
+                        try:
+                            py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                                config.LANGUAGE_CODES[window_lang])
+                        except Exception:
+                            pass
+                        config.LastSetting = window_lang
+                cache.clear()
+                config.SEARCH = True
+                update_tray_tooltip()
+
+            threading.Thread(target=alt_tab_handler, daemon=True).start()
+            return
+
+        if key not in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
+            config.alt_pressed = False
+
+        # --- Track manual layout changes ---
+        # If the user manually switched the layout (e.g. Alt+Shift), disable
+        # detection until the next mouse click.
         current_keyboard_layout = get_keyboard_layout()
+        window_lang = windows.get_active_window_langage()
 
-        # if language is manually changed by keyboard, update the window titles
-        if windows.get_active_window_langage() != current_keyboard_layout:
-
-            if  config.SaveWindowState == True:
+        if window_lang != current_keyboard_layout:
+            if config.SaveWindowState:
                 windows.set_active_window_langage(current_keyboard_layout)
-                config.LastSetting = windows.get_active_window_langage()
+                config.LastSetting = current_keyboard_layout
+            # Manual switch detected -> stop auto-detection until next click
+            cache.clear()
+            config.SEARCH = False
+            update_tray_tooltip()
 
-        # If char key is pressed, add it to the cache
-        if hasattr(key,'char'):
-            cache.push_char(key.char)
-        elif (key == keyboard.Key.space):
-            cache.push_char(' ')
-        elif (key == keyboard.Key.enter):
-            pass # placeholder
-        elif key == keyboard.Key.backspace:
-            if  len(cache)>0:
-                cache.del_char()
-        else: # Ignore other keys
+        # --- Handle character input ---
+        caps_on = False
+        try:
+            caps_on = ctypes.windll.user32.GetKeyState(0x14) & 0x0001
+        except Exception:
             pass
-            # print(f"Special key pressed: {key}")
+        is_upper_intent = shift_held ^ bool(caps_on)
 
-        if config.SEARCH:
+        if key == keyboard.Key.backspace:
+            cache.del_char()
+        elif key == keyboard.Key.space:
+            cache.push_char(' ', False)
+        elif key == keyboard.Key.enter:
+            pass  # placeholder
+        elif hasattr(key, 'char') and key.char is not None:
+            cache.push_char(key.char, is_upper_intent)
 
-            text = ''.join(cache.cache)
-            text_variants = [Languages.convert_text_bidirectional(text, Languages.english_layout, Languages.russian_layout),
-                             Languages.convert_text_bidirectional(text, Languages.russian_layout, Languages.english_layout),
-                             Languages.convert_text_bidirectional(text, Languages.hebrew_layout, Languages.english_layout),
-                             Languages.convert_text_bidirectional(text, Languages.english_layout, Languages.hebrew_layout),
-                             Languages.convert_text_bidirectional(text, Languages.russian_layout, Languages.hebrew_layout),
-                             Languages.convert_text_bidirectional(text, Languages.hebrew_layout, Languages.russian_layout),]
+        # --- Language detection (adaptive confidence) ---
+        cache_size = len(cache)
+        if (config.SEARCH and
+                cache_size >= config.EarlyDetectionMinChars):
 
-            text_variants = list(set(text_variants))
-            # print(text_variants) # For Debugging
+            required_confidence = config.get_required_confidence(cache_size)
+            text = cache.get_text()
 
-            if len(cache) > 3:
+            if not should_skip_detection(text):
+                # Generate all 6 layout conversion variants (same order as C++)
+                text_variants = [
+                    Languages.convert_text_bidirectional(text, Languages.english_layout, Languages.russian_layout),
+                    Languages.convert_text_bidirectional(text, Languages.russian_layout, Languages.english_layout),
+                    Languages.convert_text_bidirectional(text, Languages.hebrew_layout,  Languages.english_layout),
+                    Languages.convert_text_bidirectional(text, Languages.english_layout, Languages.hebrew_layout),
+                    Languages.convert_text_bidirectional(text, Languages.russian_layout, Languages.hebrew_layout),
+                    Languages.convert_text_bidirectional(text, Languages.hebrew_layout,  Languages.russian_layout),
+                ]
 
-                detected_language = [Languages.predict_language(text_variant,*model_parameters) for text_variant in text_variants]
-                # Filter the 'N/A' values from the list
-                detected_language = list(filter(None, detected_language))
+                # Order-preserving deduplication (not set())
+                text_variants = deduplicate_ordered(text_variants)
 
+                # Run prediction WITH CONFIDENCE on each variant.
+                # Pick the variant whose predicted language has the highest
+                # softmax probability.
+                best_lang = None
+                best_conf = 0.0
 
-                if (detected_language != []):
+                for variant in text_variants:
+                    result = Languages.predict_language_with_confidence(variant, *model_parameters)
+                    if result is not None and result.confidence > best_conf:
+                        best_conf = result.confidence
+                        best_lang = result.language
 
-                    language_id = str(get_keyboard_layout_info())
-                    # print("current layout was",config.LANGUAGE_ID[language_id])
+                # Act only when confidence meets the adaptive threshold.
+                if best_lang and best_conf >= required_confidence:
+                    current_lang_id = get_keyboard_layout()
+                    did_correction = False
 
-                    if config.LANGUAGE_ID[language_id] != detected_language[0]:
+                    if current_lang_id != best_lang:
+                        cached_text = cache.get_text()
+                        cache_len = len(cache)
 
-                        # Erase the cached string
-                        for _ in range(len(cache)):
+                        # Convert cached text to the detected language
+                        corrected_text = Languages.convert_text_bidirectional(
+                            cached_text,
+                            get_layout_for_language(current_lang_id),
+                            get_layout_for_language(best_lang)
+                        )
+
+                        # Preserve first-letter capitalization
+                        if cache.was_first_char_shifted() and corrected_text:
+                            corrected_text = corrected_text[0].upper() + corrected_text[1:]
+
+                        # Erase the cached characters from screen
+                        for _ in range(cache_len):
                             send_backspace()
 
-                        # Change the keyboard layout to the new language
-                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(config.LANGUAGE_CODES[detected_language[0]])
-                        windows.set_active_window_langage(detected_language[0])
-                        config.LastSetting = detected_language[0] # Set the last setting to the new language
+                        # Change the keyboard layout to the detected language
+                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                            config.LANGUAGE_CODES[best_lang])
+                        windows.set_active_window_langage(best_lang)
+                        config.LastSetting = best_lang
 
-                        # Print on the screen the new language (the cache with the new language)
-                        send_string(cache.cache)
+                        time.sleep(0.05)
 
-                    # Clear the cache
+                        # Re-type the corrected text
+                        send_string(corrected_text)
+
+                        did_correction = True
+                        update_tray_tooltip()
+
+                    # Clear cache and disable search until next mouse click
                     cache.clear()
+                    config.SEARCH = False
 
-                    # Disable the search functionality until next mouse click
-                    config.SEARCH = False # Disable the search functionality until next mouse click
+    def on_key_release(key):
+        nonlocal shift_held
+        if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            shift_held = False
 
     # Function to run when a mouse click is detected
     def on_click(x, y, button, pressed):
 
-        # If the switcher is disabled, do nothing
-        if config.EnableSwitcher == False:
+        if not config.EnableSwitcher:
             return
 
-        if pressed: # If the mouse button is pressed
+        if pressed:
+            cache.clear()
+            config.SEARCH = True
 
-            cache.clear()  # Clear the key cache
-            config.SEARCH = True  # Set the Language Change SEARCH flag to true
-            #print(f"Mouse clicked at ({x}, {y}) with button {button}")
+            current_keyboard_layout = get_keyboard_layout()
+            if config.SaveWindowState:
+                window_lang = windows.get_active_window_langage()
+                if (window_lang != current_keyboard_layout and
+                        current_keyboard_layout != config.LastSetting):
+                    windows.set_active_window_langage(current_keyboard_layout)
+                    config.LastSetting = current_keyboard_layout
+                else:
+                    if window_lang is None:
+                        window_lang = config.LastSetting
+                    try:
+                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                            config.LANGUAGE_CODES[window_lang])
+                        config.LastSetting = window_lang
+                    except Exception:
+                        window_lang = config.LastSetting
+                        py_win_keyboard_layout.change_foreground_window_keyboard_layout(
+                            config.LANGUAGE_CODES[window_lang])
 
-        # Get current keyboard layout
-        current_keyboard_layout = get_keyboard_layout()
+            update_tray_tooltip()
 
-        # if language is manually changed, update the window language
-        if (windows.get_active_window_langage() != current_keyboard_layout) and (current_keyboard_layout != config.LastSetting):
-            # manual_setting = True
-            if config.SaveWindowState == True:
-                windows.set_active_window_langage(current_keyboard_layout)
-                config.LastSetting = current_keyboard_layout
-        else:
-            # manual_setting = False
-
-            if config.SaveWindowState == True:
-                # Check if the active window language is None (meaning no active window)
-                active_window_language = windows.get_active_window_langage()
-
-                if active_window_language is None:
-                    active_window_language = config.LastSetting
-
-                # Change the keyboard layout to the window language
-                try:
-                    py_win_keyboard_layout.change_foreground_window_keyboard_layout(
-                        config.LANGUAGE_CODES[active_window_language])
-                    config.LastSetting = active_window_language  # Set the last setting to the new language
-                except:
-                    # unable to change keyboard layout properly
-                    active_window_language = config.LastSetting
-                    py_win_keyboard_layout.change_foreground_window_keyboard_layout(
-                        config.LANGUAGE_CODES[active_window_language])
-
-    # Create and start a keyboard and mouse listeners on start
-    keyboard_listener = keyboard.Listener(on_press=on_keypress)
+    # Create and start keyboard and mouse listeners
+    keyboard_listener = keyboard.Listener(on_press=on_keypress, on_release=on_key_release)
     mouse_listener = mouse.Listener(on_click=on_click)
 
     keyboard_listener.start()
     mouse_listener.start()
 
-# Get the keyboard layout info
-def get_keyboard_layout_info():
-    return py_win_keyboard_layout.get_foreground_window_keyboard_layout() & 0xFFFF
 
-# Create a system tray icon
+# ============================================================
+# Periodic cleanup of stale window entries (every 60 seconds)
+# (mirrors C++ WM_TIMER cleanup)
+# ============================================================
+def periodic_cleanup():
+    while True:
+        time.sleep(60)
+        try:
+            windows.cleanup()
+        except Exception:
+            pass
+
+
+# ============================================================
+# System tray icon
+# ============================================================
 def create_system_tray_icon():
+    global g_tray_icon
     image = Image.open("keyboard.ico")
 
     menu = pystray.Menu(
-        #set radio button for search
-        pystray.MenuItem('Enable Switcher', enable_switcher, checked=lambda item: config.EnableSwitcher, radio=True),
-        pystray.MenuItem('Save window state', enable_window_state, checked=lambda item: config.SaveWindowState, radio=True, enabled=lambda item: config.EnableSwitcher),
+        pystray.MenuItem('Enable Switcher', enable_switcher,
+                         checked=lambda item: config.EnableSwitcher, radio=True),
+        pystray.MenuItem('Save window state', enable_window_state,
+                         checked=lambda item: config.SaveWindowState, radio=True,
+                         enabled=lambda item: config.EnableSwitcher),
         pystray.MenuItem('About', tray_about),
-        pystray.Menu.SEPARATOR,  # Separator
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem('Exit', on_tray_exit)
-        )
-    icon = pystray.Icon("KeyboardSwitcher", image, "Keyboard Switcher", menu)
-    icon.run()
+    )
+    g_tray_icon = pystray.Icon("KeyboardSwitcher", image, "Keyboard Switcher", menu)
+    g_tray_icon.run()
 
-# Enable/Disable the Application
+
 def enable_switcher(icon, item):
-    config.EnableSwitcher = not(config.EnableSwitcher)
-    # Disable menu item "Save window state" if the switcher is disable
+    config.EnableSwitcher = not config.EnableSwitcher
 
-# Enable/Disable the window state saving
+
 def enable_window_state(icon, item):
-    config.SaveWindowState = not(config.SaveWindowState)
+    config.SaveWindowState = not config.SaveWindowState
 
-# Function to run when the system tray exit button is clicked
+
 def on_tray_exit(icon, item):
     if item.text == 'Exit':
         icon.stop()
 
-# Display "About" information in the system tray
+
 def tray_about(icon, item):
-    icon.notify('Click on text area and start typing','Keyboard Switcher v1.1')
+    icon.notify('Click on text area and start typing',
+                f'Keyboard Switcher v{config.VERSION}')
     time.sleep(3)
     icon.remove_notification()
 
 
-# Send a backspace to the keyboard
-def send_backspace():
-    keyboard_controller = keyboard.Controller()
-    with keyboard_controller.pressed(keyboard.Key.backspace):
-        pass
-        #time.sleep(0.01)  # Adjust the duration as needed (in seconds)
-
-# Send a key to the keyboard
-def send_string(cache):
-    # Create a keyboard controller
-    keyboard_controller = keyboard.Controller()
-
-    for char in cache:
-        # Simulate pressing and releasing the character key
-        with keyboard_controller.pressed(char):
-            pass
-            #time.sleep(0.01)  # Adjust the duration as needed (in seconds)
-
-
-def switcher(text, layout_from, layout_to):
-    converted_text = convert_text_bidirectional(text, layout_from, layout_to)
-    return converted_text
-
-
+# ============================================================
+# Entry point
+# ============================================================
 if __name__ == "__main__":
 
-    # Create kerboard cache
+    # Create keyboard cache
     cache = InputCache()
 
-    # Create a dataclass of open windows
+    # Create window tracker with current keyboard language
     language_id = str(get_keyboard_layout_info())
     windows = OpenWindows(language_id)
 
-    model_parameters = Languages.load_model() # Loading the model parameters
+    # Load the ONNX model
+    model_parameters = Languages.load_model()
 
     # Start the background task in a separate thread
-    bg_thread = threading.Thread(target=background_task(cache), daemon=True)
+    bg_thread = threading.Thread(target=background_task, args=(cache,), daemon=True)
     bg_thread.start()
+
+    # Start periodic window cleanup thread (mirrors C++ SetTimer)
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
 
     print('Model is loaded and the background task is running')
 
     create_system_tray_icon()
     sys.exit(0)
-
-
 
 
