@@ -9,7 +9,7 @@ namespace Config {
     std::string LastSetting = "en";
 
     // ── Adaptive confidence curve parameters ──
-    int   EarlyDetectionMinChars = 3;      // earliest detection fires here
+    int   EarlyDetectionMinChars = 4;      // earliest detection fires here
     int   FullConfidenceChars    = 10;     // confidence floor kicks in here
     float ConfidenceAtMinChars   = 0.97f;  // near-certainty at few chars
     float ConfidenceAtMaxChars   = 0.55f;  // relaxed after enough chars

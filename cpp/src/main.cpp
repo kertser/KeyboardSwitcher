@@ -123,34 +123,36 @@ static void ChangeKeyboardLayout(const std::string& lang) {
 // Helper: send N backspaces via SendInput
 // ============================================================
 static void SendBackspaces(size_t count) {
+    // Batch all backspace key-down/key-up pairs into a single SendInput call
+    // to minimise the time window where real keystrokes could slip through.
+    std::vector<INPUT> inputs(count * 2);
     for (size_t i = 0; i < count; ++i) {
-        INPUT inputs[2] = {};
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wVk = VK_BACK;
-        inputs[0].ki.dwFlags = 0;
-        inputs[1].type = INPUT_KEYBOARD;
-        inputs[1].ki.wVk = VK_BACK;
-        inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, inputs, sizeof(INPUT));
-        Sleep(5);
+        inputs[i * 2].type = INPUT_KEYBOARD;
+        inputs[i * 2].ki.wVk = VK_BACK;
+        inputs[i * 2].ki.dwFlags = 0;
+        inputs[i * 2 + 1].type = INPUT_KEYBOARD;
+        inputs[i * 2 + 1].ki.wVk = VK_BACK;
+        inputs[i * 2 + 1].ki.dwFlags = KEYEVENTF_KEYUP;
     }
+    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
 // ============================================================
 // Helper: send a string via SendInput (Unicode chars)
 // ============================================================
 static void SendString(const std::vector<wchar_t>& chars) {
-    for (wchar_t ch : chars) {
-        INPUT inputs[2] = {};
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wScan = ch;
-        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[1].type = INPUT_KEYBOARD;
-        inputs[1].ki.wScan = ch;
-        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(2, inputs, sizeof(INPUT));
-        Sleep(5);
+    // Batch all Unicode key-down/key-up pairs into a single SendInput call
+    // to minimise the time window where real keystrokes could collide.
+    std::vector<INPUT> inputs(chars.size() * 2);
+    for (size_t i = 0; i < chars.size(); ++i) {
+        inputs[i * 2].type = INPUT_KEYBOARD;
+        inputs[i * 2].ki.wScan = chars[i];
+        inputs[i * 2].ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[i * 2 + 1].type = INPUT_KEYBOARD;
+        inputs[i * 2 + 1].ki.wScan = chars[i];
+        inputs[i * 2 + 1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
     }
+    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
 // ============================================================
@@ -222,8 +224,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     KBDLLHOOKSTRUCT* pKb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
-    // Skip injected / synthetic keystrokes (from SendInput)
-    if (g_isSendingInput.load() || (pKb->flags & LLKHF_INJECTED))
+    // During retyping: let our own injected keystrokes through,
+    // but EAT (block) real user keystrokes so they don't collide.
+    if (g_isSendingInput.load()) {
+        if (pKb->flags & LLKHF_INJECTED)
+            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam); // our SendInput – pass
+        return 1; // real user keystroke during retyping – eat it
+    }
+    // Outside of retyping, ignore injected keystrokes (avoid re-processing)
+    if (pKb->flags & LLKHF_INJECTED)
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
 
     // Only process key-down events
@@ -408,7 +417,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     }
                     Config::LastSetting = bestLang;
 
-                    Sleep(50);
+                    Sleep(20); // Brief wait for layout change to propagate
 
                     // Re-type the full corrected text
                     std::vector<wchar_t> correctedChars(correctedText.begin(), correctedText.end());
