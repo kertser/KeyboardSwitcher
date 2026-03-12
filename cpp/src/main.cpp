@@ -248,6 +248,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     }
 
     // --- Track manual layout changes ---
+    // If the user manually switched the layout (e.g. Alt+Shift), disable
+    // detection until the next mouse click – the user already chose a language.
     std::string currentLayout = GetCurrentKeyboardLayout();
     if (g_windows) {
         std::string windowLang = g_windows->GetActiveWindowLanguage();
@@ -256,6 +258,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 g_windows->SetActiveWindowLanguage(currentLayout);
                 Config::LastSetting = currentLayout;
             }
+            // Manual switch detected → stop auto-detection until next click
+            g_cache.Clear();
+            Config::SEARCH.store(false);
         }
     }
 

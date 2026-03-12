@@ -9,7 +9,7 @@ namespace Config {
     std::string LastSetting = "en";
 
     // Minimum characters before detection (detection fires when cache size > this value)
-    std::atomic<int> MinCharsBeforeDetection{3};
+    std::atomic<int> MinCharsBeforeDetection{5};
 
     // Minimum softmax confidence to trigger a language switch
     float MinConfidence = 0.6f;
