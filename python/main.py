@@ -4,7 +4,8 @@
 import threading
 import pystray
 import Languages
-from Languages import convert_text_bidirectional, get_layout_for_language
+from Languages import (convert_text_bidirectional, get_layout_for_language,
+                       DetectionHistory, typo_resilient_detect)
 from PIL import Image
 from dataclasses import dataclass, field
 import py_win_keyboard_layout
@@ -187,6 +188,7 @@ def background_task(cache):
 
     # Track shift state via pynput modifier events
     shift_held = False
+    history = DetectionHistory()
 
     def on_keypress(key):
         nonlocal shift_held
@@ -224,6 +226,7 @@ def background_task(cache):
                             pass
                         config.LastSetting = window_lang
                 cache.clear()
+                history.clear()
                 config.SEARCH = True
                 update_tray_tooltip()
 
@@ -245,6 +248,7 @@ def background_task(cache):
                 config.LastSetting = current_keyboard_layout
             # Manual switch detected -> stop auto-detection until next click
             cache.clear()
+            history.clear()
             config.SEARCH = False
             update_tray_tooltip()
 
@@ -287,20 +291,17 @@ def background_task(cache):
                 # Order-preserving deduplication (not set())
                 text_variants = deduplicate_ordered(text_variants)
 
-                # Run prediction WITH CONFIDENCE on each variant.
-                # Pick the variant whose predicted language has the highest
-                # softmax probability.
-                best_lang = None
-                best_conf = 0.0
+                # Typo-resilient detection: consecutive agreement + drop-one boosting
+                detection = typo_resilient_detect(
+                    text_variants, required_confidence, history,
+                    *model_parameters,
+                    enable_typo_resilience=config.EnableTypoResilience,
+                    consecutive_agreement_count=config.ConsecutiveAgreementCount,
+                    borderline_zone_factor=config.BorderlineZoneFactor,
+                )
 
-                for variant in text_variants:
-                    result = Languages.predict_language_with_confidence(variant, *model_parameters)
-                    if result is not None and result.confidence > best_conf:
-                        best_conf = result.confidence
-                        best_lang = result.language
-
-                # Act only when confidence meets the adaptive threshold.
-                if best_lang and best_conf >= required_confidence:
+                if detection is not None:
+                    best_lang = detection.language
                     current_lang_id = get_keyboard_layout()
                     did_correction = False
 
@@ -339,6 +340,7 @@ def background_task(cache):
 
                     # Clear cache and disable search until next mouse click
                     cache.clear()
+                    history.clear()
                     config.SEARCH = False
 
     def on_key_release(key):
@@ -354,6 +356,7 @@ def background_task(cache):
 
         if pressed:
             cache.clear()
+            history.clear()
             config.SEARCH = True
 
             current_keyboard_layout = get_keyboard_layout()
@@ -405,12 +408,27 @@ def create_system_tray_icon():
     global g_tray_icon
     image = Image.open("keyboard.ico")
 
+    min_chars_submenu = pystray.Menu(
+        pystray.MenuItem('3 characters', lambda icon, item: set_min_chars(3),
+                         checked=lambda item: config.EarlyDetectionMinChars == 3),
+        pystray.MenuItem('4 characters', lambda icon, item: set_min_chars(4),
+                         checked=lambda item: config.EarlyDetectionMinChars == 4),
+        pystray.MenuItem('5 characters', lambda icon, item: set_min_chars(5),
+                         checked=lambda item: config.EarlyDetectionMinChars == 5),
+    )
+
     menu = pystray.Menu(
         pystray.MenuItem('Enable Switcher', enable_switcher,
                          checked=lambda item: config.EnableSwitcher, radio=True),
         pystray.MenuItem('Save window state', enable_window_state,
                          checked=lambda item: config.SaveWindowState, radio=True,
                          enabled=lambda item: config.EnableSwitcher),
+        pystray.MenuItem('Typo Resilience', toggle_typo_resilience,
+                         checked=lambda item: config.EnableTypoResilience, radio=True,
+                         enabled=lambda item: config.EnableSwitcher),
+        pystray.MenuItem('Min Chars Before Detection', min_chars_submenu,
+                         enabled=lambda item: config.EnableSwitcher),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem('About', tray_about),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Exit', on_tray_exit)
@@ -425,6 +443,14 @@ def enable_switcher(icon, item):
 
 def enable_window_state(icon, item):
     config.SaveWindowState = not config.SaveWindowState
+
+
+def toggle_typo_resilience(icon, item):
+    config.EnableTypoResilience = not config.EnableTypoResilience
+
+
+def set_min_chars(value):
+    config.EarlyDetectionMinChars = value
 
 
 def on_tray_exit(icon, item):

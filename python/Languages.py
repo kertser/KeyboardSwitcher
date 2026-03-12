@@ -170,6 +170,89 @@ def convert_text_bidirectional(text, from_layout, to_layout):
     return convert_text(text, create_conversion_map(from_layout, to_layout))
 
 
+# ============================================================
+# Detection history — consecutive-keystroke agreement tracker
+# (mirrors C++ DetectionHistory)
+# ============================================================
+class DetectionHistory:
+    def __init__(self):
+        self.last_lang = ""
+        self.streak = 0
+
+    def update(self, lang: str, confidence: float = 0.0):
+        if lang == self.last_lang:
+            self.streak += 1
+        else:
+            self.last_lang = lang
+            self.streak = 1
+
+    def is_consistent(self, current_lang: str, required_count: int) -> bool:
+        return current_lang == self.last_lang and self.streak >= required_count
+
+    def clear(self):
+        self.last_lang = ""
+        self.streak = 0
+
+
+# ============================================================
+# Typo-resilient detection wrapper
+# (mirrors C++ TypoResilientDetect)
+# ============================================================
+def typo_resilient_detect(
+    text_variants: list,
+    required_confidence: float,
+    history: DetectionHistory,
+    ort_session, char_to_index, max_length,
+    *,
+    enable_typo_resilience: bool = True,
+    consecutive_agreement_count: int = 2,
+    borderline_zone_factor: float = 0.85,
+) -> Optional[DetectionResult]:
+    """Run detection across layout variants with typo resilience.
+
+    Tier 1 — consecutive-agreement gate (zero extra model calls).
+    Tier 2 — drop-one confidence boosting (borderline zone only).
+    """
+    best_lang = None
+    best_conf = 0.0
+    best_variant = ""
+
+    for variant in text_variants:
+        result = predict_language_with_confidence(variant, ort_session, char_to_index, max_length)
+        if result is not None and result.confidence > best_conf:
+            best_conf = result.confidence
+            best_lang = result.language
+            best_variant = variant
+
+    if not best_lang:
+        history.update("", 0.0)
+        return None
+
+    # --- Tier 2: Drop-one boosting (borderline zone) ---
+    if (enable_typo_resilience and
+            best_conf < required_confidence and
+            best_conf >= required_confidence * borderline_zone_factor and
+            len(best_variant) > 2):
+        for i in range(len(best_variant)):
+            dropped = best_variant[:i] + best_variant[i + 1:]
+            res = predict_language_with_confidence(dropped, ort_session, char_to_index, max_length)
+            if res is not None and res.language == best_lang and res.confidence > best_conf:
+                best_conf = res.confidence
+
+    # Update history
+    history.update(best_lang, best_conf)
+
+    # --- Tier 1: Consecutive-agreement gate ---
+    if enable_typo_resilience:
+        if not history.is_consistent(best_lang, consecutive_agreement_count):
+            return None
+
+    if best_conf >= required_confidence:
+        return DetectionResult(language=best_lang, confidence=best_conf, scores=[])
+
+    return None
+
+
 if __name__ == '__main__':
     # Example
     input_text = "hello"

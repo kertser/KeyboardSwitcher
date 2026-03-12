@@ -1,4 +1,5 @@
 #include "Languages.h"
+#include "Config.h"
 
 #include <onnxruntime_cxx_api.h>
 #include <windows.h>
@@ -305,3 +306,98 @@ std::optional<DetectionResult> LanguageDetector::PredictLanguageWithConfidence(c
     }
 }
 
+
+// ============================================================
+// DetectionHistory
+// ============================================================
+void DetectionHistory::Update(const std::string& lang, float /*confidence*/) {
+    if (lang == lastLang_) {
+        ++streak_;
+    } else {
+        lastLang_ = lang;
+        streak_ = 1;
+    }
+}
+
+bool DetectionHistory::IsConsistent(const std::string& currentLang, int requiredCount) const {
+    return currentLang == lastLang_ && streak_ >= requiredCount;
+}
+
+void DetectionHistory::Clear() {
+    lastLang_.clear();
+    streak_ = 0;
+}
+
+// ============================================================
+// Typo-resilient detection
+// ============================================================
+std::optional<DetectionResult> TypoResilientDetect(
+    LanguageDetector& detector,
+    const std::vector<std::wstring>& textVariants,
+    float requiredConfidence,
+    DetectionHistory& history)
+{
+    // --- Standard best-variant detection (same as before) ---
+    std::string bestLang;
+    float       bestConf = 0.0f;
+    std::wstring bestVariant;
+
+    for (const auto& variant : textVariants) {
+        auto result = detector.PredictLanguageWithConfidence(variant);
+        if (result.has_value() && result->confidence > bestConf) {
+            bestConf = result->confidence;
+            bestLang = result->language;
+            bestVariant = variant;
+        }
+    }
+
+    if (bestLang.empty()) {
+        history.Update("", 0.0f);
+        return std::nullopt;
+    }
+
+    // --- Tier 2: Drop-one boosting (borderline zone) ---
+    // If the confidence is close to but below the threshold, a single typo
+    // character may be dragging it down.  Try removing each character once
+    // and see if confidence jumps above the threshold.
+    if (Config::EnableTypoResilience &&
+        bestConf < requiredConfidence &&
+        bestConf >= requiredConfidence * Config::BorderlineZoneFactor &&
+        bestVariant.size() > 2)
+    {
+        for (size_t i = 0; i < bestVariant.size(); ++i) {
+            std::wstring dropped = bestVariant.substr(0, i)
+                                 + bestVariant.substr(i + 1);
+            auto res = detector.PredictLanguageWithConfidence(dropped);
+            if (res.has_value() &&
+                res->language == bestLang &&
+                res->confidence > bestConf)
+            {
+                bestConf = res->confidence;
+            }
+        }
+    }
+
+    // Update the history with whatever language won this round.
+    history.Update(bestLang, bestConf);
+
+    // --- Tier 1: Consecutive-agreement gate ---
+    // Even if confidence is high, require N consecutive keystrokes to
+    // agree before committing.  This is free (no extra model calls) and
+    // prevents a single-typo from triggering a spurious switch.
+    if (Config::EnableTypoResilience) {
+        if (!history.IsConsistent(bestLang, Config::ConsecutiveAgreementCount)) {
+            // Not enough agreement yet — keep accumulating.
+            return std::nullopt;
+        }
+    }
+
+    if (bestConf >= requiredConfidence) {
+        DetectionResult result = {};
+        result.language = bestLang;
+        result.confidence = bestConf;
+        return result;
+    }
+
+    return std::nullopt;
+}

@@ -8,7 +8,7 @@
 namespace Config {
 
     // Application version
-    constexpr const wchar_t* VERSION = L"1.2.1";
+    constexpr const wchar_t* VERSION = L"1.2.2";
 
     // Global flags (atomic for thread safety)
     extern std::atomic<bool> EnableSwitcher;
@@ -33,6 +33,19 @@ namespace Config {
 
     // Compute the required softmax confidence for a given number of typed chars.
     float GetRequiredConfidence(size_t numChars);
+
+    // ── Typo resilience ──
+    // Consecutive-agreement: require N consecutive keystrokes to predict the
+    // same language before triggering a switch.  Prevents a single mis-typed
+    // key from causing a false-positive switch.
+    extern int   ConsecutiveAgreementCount;     // default: 2
+    // Drop-one boosting: if confidence falls in the borderline zone
+    // [threshold * BorderlineZoneFactor .. threshold], try removing each
+    // character once and re-run the model.  If the best drop-one confidence
+    // exceeds the threshold the detection succeeds — prevents a single typo
+    // from suppressing a true detection (false-negative).
+    extern float BorderlineZoneFactor;          // default: 0.85
+    extern bool  EnableTypoResilience;          // master toggle (default: true)
 
     // Language codes for ActivateKeyboardLayout / PostMessage
     extern const std::unordered_map<std::string, HKL> LANGUAGE_CODES;

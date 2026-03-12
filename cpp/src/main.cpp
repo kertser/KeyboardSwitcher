@@ -34,6 +34,7 @@ static HHOOK g_mouseHook = nullptr;
 static HWND  g_hwndHidden = nullptr;
 
 static InputCache          g_cache;
+static DetectionHistory    g_history;
 static WindowTracker*      g_windows = nullptr;
 static LanguageDetector*   g_detector = nullptr;
 static TrayIcon            g_trayIcon;
@@ -266,6 +267,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 }
             }
             g_cache.Clear();
+            g_history.Clear();
             Config::SEARCH.store(true);
             UpdateTrayTooltip();
         }).detach();
@@ -288,6 +290,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             }
             // Manual switch detected → stop auto-detection until next click
             g_cache.Clear();
+            g_history.Clear();
             Config::SEARCH.store(false);
             UpdateTrayTooltip();
         }
@@ -364,24 +367,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 textVariants = std::move(unique);
             }
 
-            // Run prediction WITH CONFIDENCE on each variant.
-            // Pick the variant whose predicted language has the highest
-            // softmax probability – that is the most likely interpretation.
-            std::string bestLang;
-            float       bestConf = 0.0f;
+            // Typo-resilient detection: consecutive agreement + drop-one boosting
+            auto detection = TypoResilientDetect(
+                *g_detector, textVariants, requiredConfidence, g_history);
 
-            for (const auto& variant : textVariants) {
-                auto result = g_detector->PredictLanguageWithConfidence(variant);
-                if (result.has_value() && result->confidence > bestConf) {
-                    bestConf = result->confidence;
-                    bestLang = result->language;
-                }
-            }
-
-            // Act only when confidence meets the adaptive threshold.
-            // If the bar is not met we keep accumulating characters –
-            // the next keystroke will lower the bar and try again.
-            if (!bestLang.empty() && bestConf >= requiredConfidence) {
+            if (detection.has_value()) {
+                const std::string& bestLang = detection->language;
                 std::string currentLangId = GetCurrentKeyboardLayout();
                 bool didCorrection = false;
 
@@ -430,6 +421,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                 // Clear cache and disable search until next mouse click
                 g_cache.Clear();
+                g_history.Clear();
                 Config::SEARCH.store(false);
 
                 if (didCorrection) {
@@ -453,6 +445,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
 
     if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) {
         g_cache.Clear();
+        g_history.Clear();
         Config::SEARCH.store(true);
 
         std::string currentLayout = GetCurrentKeyboardLayout();
@@ -494,6 +487,31 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     | (Config::SaveWindowState.load() ? MF_CHECKED : MF_UNCHECKED)
                     | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
                     ID_TRAY_SAVE_WINDOW, L"Save window state");
+                AppendMenuW(hMenu,
+                    MF_STRING
+                    | (Config::EnableTypoResilience ? MF_CHECKED : MF_UNCHECKED)
+                    | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
+                    ID_TRAY_TYPO_RESILIENCE, L"Typo Resilience");
+
+                // Min Chars Before Detection submenu
+                HMENU hSubMenu = CreatePopupMenu();
+                if (hSubMenu) {
+                    int cur = Config::EarlyDetectionMinChars;
+                    AppendMenuW(hSubMenu,
+                        MF_STRING | (cur == 3 ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_MINCHARS_3, L"3 characters");
+                    AppendMenuW(hSubMenu,
+                        MF_STRING | (cur == 4 ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_MINCHARS_4, L"4 characters");
+                    AppendMenuW(hSubMenu,
+                        MF_STRING | (cur == 5 ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_MINCHARS_5, L"5 characters");
+                    AppendMenuW(hMenu,
+                        MF_POPUP | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
+                        (UINT_PTR)hSubMenu, L"Min Chars Before Detection");
+                }
+
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"About");
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -512,6 +530,18 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_SAVE_WINDOW:
             Config::SaveWindowState.store(!Config::SaveWindowState.load());
+            break;
+        case ID_TRAY_TYPO_RESILIENCE:
+            Config::EnableTypoResilience = !Config::EnableTypoResilience;
+            break;
+        case ID_TRAY_MINCHARS_3:
+            Config::EarlyDetectionMinChars = 3;
+            break;
+        case ID_TRAY_MINCHARS_4:
+            Config::EarlyDetectionMinChars = 4;
+            break;
+        case ID_TRAY_MINCHARS_5:
+            Config::EarlyDetectionMinChars = 5;
             break;
         case ID_TRAY_ABOUT:
             g_trayIcon.ShowBalloon((std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),

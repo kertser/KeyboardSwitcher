@@ -34,6 +34,7 @@ via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
+| **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
 | **Per-window language memory** | Remembers the language for each window and restores it on focus change |
 | **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), detection is paused until the next mouse click |
 | **Capitalization preservation** | If the first letter was typed with Shift, the corrected text keeps the capital letter |
@@ -41,6 +42,7 @@ via ONNX Runtime.
 | **System tray menu** | Right-click to enable/disable the switcher, toggle window-state saving, or exit |
 | **Alt+Tab awareness** | Restores the per-window language after Alt+Tab switching |
 | **Edge-case filtering** | Skips detection for URLs, file paths, and mostly non-alphabetic input |
+| **Input collision guard** | Blocks real keystrokes during the retyping phase to prevent garbled output |
 
 ## Project Structure
 

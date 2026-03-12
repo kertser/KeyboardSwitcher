@@ -1,5 +1,5 @@
 # Application version (keep in sync with C++ Config.h)
-VERSION = "1.2.0"
+VERSION = "1.2.2"
 
 EnableSwitcher = True # Enable switching between languages
 SEARCH = False # Disable search functionality until a language is selected
@@ -10,10 +10,15 @@ LastSetting = 'en' # Last language selected
 # Detection starts at EarlyDetectionMinChars but requires very high confidence.
 # As the user types more characters the required confidence drops linearly
 # until FullConfidenceChars, after which the floor applies.
-EarlyDetectionMinChars = 3       # earliest detection fires here
+EarlyDetectionMinChars = 3       # earliest detection fires here (default menu selection)
 FullConfidenceChars    = 10      # confidence floor kicks in here
 ConfidenceAtMinChars   = 0.97    # near-certainty at few chars
 ConfidenceAtMaxChars   = 0.55    # relaxed after enough chars
+
+# ── Typo resilience parameters (keep in sync with C++ Config) ──
+ConsecutiveAgreementCount = 2    # consecutive keystrokes must agree before switch
+BorderlineZoneFactor      = 0.85 # drop-one boosting triggers in [threshold*factor, threshold]
+EnableTypoResilience      = True # master toggle
 
 def get_required_confidence(num_chars: int) -> float:
     """Compute the required softmax confidence for a given number of typed chars."""
