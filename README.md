@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.1
+# Keyboard Switcher v1.2.2
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -80,7 +80,8 @@ KeyboardSwitcher/
 │   ├── resources/
 │   │   ├── resource.h
 │   │   └── resource.rc
-│   └── onnxruntime/         # ONNX Runtime SDK (not checked in)
+│   ├── onnxruntime/         # ONNX Runtime SDK (not checked in)
+│   └── dist/                # Release build output (not checked in)
 └── README.md
 ```
 
@@ -108,17 +109,39 @@ python main.py
    │   └── onnxruntime_cxx_api.h  (and other headers)
    └── lib/
        ├── onnxruntime.lib
-       └── onnxruntime.dll
+       ├── onnxruntime.dll
+       └── onnxruntime_providers_shared.dll
    ```
 
-2. Configure and build:
+2. **Debug build** (from CLion or command line):
    ```bash
    cd cpp
-   cmake -B build
-   cmake --build build --config Release
+   cmake -B cmake-build-debug
+   cmake --build cmake-build-debug
    ```
 
-3. Copy `lang_model.onnx`, `dictionary.json`, `keyboard.ico`, and `onnxruntime.dll` next to the built executable.
+3. **Release build for distribution** (self-contained, no MinGW DLLs needed):
+   ```bash
+   cd cpp
+   cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+   cmake --build cmake-build-release --config Release
+   cmake --install cmake-build-release --prefix ./dist
+   ```
+   The `dist/` folder will contain everything needed to run the application:
+   ```
+   dist/
+   ├── KeyboardSwitcher.exe
+   ├── onnxruntime.dll
+   ├── onnxruntime_providers_shared.dll
+   ├── lang_model.onnx
+   ├── dictionary.json
+   └── keyboard.ico
+   ```
+
+> **Note:** When building with MinGW, the CMake configuration automatically
+> applies `-static-libgcc -static-libstdc++ -static` so the resulting
+> executable only depends on standard Windows system DLLs and the bundled
+> ONNX Runtime DLL — no MinGW runtime DLLs are required on the target machine.
 
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference

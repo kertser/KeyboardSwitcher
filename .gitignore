@@ -197,5 +197,6 @@ cython_debug/
 #.idea/
 
 /cpp/cmake-build-debug/
+/cpp/cmake-build-release/
+/cpp/dist/
 .idea/
-/cpp/cmake-build-debug/

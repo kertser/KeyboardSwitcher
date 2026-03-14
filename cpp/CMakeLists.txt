@@ -108,6 +108,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE UNICODE _UNICODE)
 
+# ── Static-link MinGW runtimes so no libstdc++/libgcc DLLs needed ──
+if(MINGW)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        -static-libgcc
+        -static-libstdc++
+        -static
+    )
+endif()
+
 # ── Copy data files to build output ─────────────────────────
 set(DATA_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/lang_model.onnx"
@@ -125,7 +134,7 @@ foreach(DATA_FILE ${DATA_FILES})
     )
 endforeach()
 
-# Copy ONNX Runtime DLL to output
+# Copy ONNX Runtime DLLs to output
 if(ONNXRUNTIME_DLL)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -133,6 +142,38 @@ if(ONNXRUNTIME_DLL)
             "$<TARGET_FILE_DIR:${PROJECT_NAME}>/onnxruntime.dll"
         COMMENT "Copying onnxruntime.dll to output directory"
     )
+endif()
+
+# Also copy onnxruntime_providers_shared.dll if it exists
+find_file(ONNXRUNTIME_PROVIDERS_DLL
+    NAMES onnxruntime_providers_shared.dll
+    PATHS "${ONNXRUNTIME_ROOT}/lib"
+    NO_DEFAULT_PATH
+)
+if(ONNXRUNTIME_PROVIDERS_DLL)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_PROVIDERS_DLL}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/onnxruntime_providers_shared.dll"
+        COMMENT "Copying onnxruntime_providers_shared.dll to output directory"
+    )
+endif()
+
+# ── Install / Export target ─────────────────────────────────
+# Usage: cmake --install <build-dir> --prefix <output-folder>
+#   e.g. cmake --install cmake-build-release --prefix ./dist
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION .)
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/lang_model.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/dictionary.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico"
+    DESTINATION .
+)
+if(ONNXRUNTIME_DLL)
+    install(FILES "${ONNXRUNTIME_DLL}" DESTINATION .)
+endif()
+if(ONNXRUNTIME_PROVIDERS_DLL)
+    install(FILES "${ONNXRUNTIME_PROVIDERS_DLL}" DESTINATION .)
 endif()
 
 
