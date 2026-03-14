@@ -8,6 +8,8 @@ Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on 
 - [Project Structure](#project-structure)
 - [Python Version](#python-version)
 - [C++ Version](#c-version)
+- [Packaging / Installer](#packaging--installer)
+- [Windows Defender / SmartScreen](#windows-defender--smartscreen)
 - [Usage](#usage)
 - [Contributing](#contributing)
 - [License](#license)
@@ -79,9 +81,11 @@ KeyboardSwitcher/
 │   │   └── TrayIcon.cpp
 │   ├── resources/
 │   │   ├── resource.h
+│   │   ├── resource.rc.in   # Template with VERSIONINFO (processed by CMake)
 │   │   └── resource.rc
 │   ├── onnxruntime/         # ONNX Runtime SDK (not checked in)
 │   └── dist/                # Release build output (not checked in)
+├── LICENSE
 └── README.md
 ```
 
@@ -147,6 +151,52 @@ python main.py
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference
 - [nlohmann/json](https://github.com/nlohmann/json) — JSON parsing (fetched automatically by CMake)
 - Win32 API — keyboard/mouse hooks, system tray, keyboard layout switching
+
+## Packaging / Installer
+
+The build system uses **CPack** to produce distributable packages.
+Run the following commands from the release build directory (`cmake-build-release/`):
+
+| Format | Command | Output | Requires |
+|---|---|---|---|
+| **ZIP** (portable) | `cpack -G ZIP` | `KeyboardSwitcher-<version>-win64.zip` | Nothing extra |
+| **NSIS** (installer) | `cpack -G NSIS` | `KeyboardSwitcher-<version>-win64.exe` | [NSIS](https://nsis.sourceforge.io/Download) on PATH |
+
+The **NSIS installer** provides a standard Windows setup wizard with:
+- Install / uninstall via *Add or Remove Programs*
+- Start-menu shortcut
+- License agreement page
+
+The **ZIP** is a portable archive — just extract and run.
+
+### Full example (build + package):
+```bash
+cd cpp
+cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+cmake --build cmake-build-release --config Release
+cd cmake-build-release
+cpack -G ZIP        # portable archive
+cpack -G NSIS       # installer (requires NSIS)
+```
+
+## Windows Defender / SmartScreen
+
+Windows may show a **"Windows protected your PC"** warning on first run because the
+executable is unsigned and has no download reputation yet. This is expected for any
+new, unsigned application.
+
+**What is already in place:**
+- The `.exe` embeds a full **VERSIONINFO** resource (company name, product name,
+  version, copyright). This helps Defender heuristics and makes the binary look
+  legitimate in *Properties → Details*.
+
+**To further reduce or eliminate warnings:**
+
+| Approach | Cost | Effect |
+|---|---|---|
+| **Submit to Microsoft** for analysis | Free | Upload the `.exe` at [Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission) to request whitelisting. Takes a few days. |
+| **Code-signing certificate** | ~\$70–\$400 /year | A signed binary is trusted immediately. An **EV certificate** builds instant SmartScreen reputation. |
+| **Build reputation over time** | Free | The more users run the app, the faster SmartScreen stops warning. |
 
 ## Usage
 1. Run the program — it appears as a tray icon.

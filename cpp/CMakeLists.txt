@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(KeyboardSwitcher LANGUAGES CXX)
+project(KeyboardSwitcher VERSION 1.2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,9 @@ add_executable(${PROJECT_NAME} WIN32
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+# SYSTEM suppresses SAL-annotation redefinition warnings from the ONNX headers
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     ${ONNXRUNTIME_INCLUDE_DIR}
 )
 
@@ -176,5 +179,39 @@ if(ONNXRUNTIME_PROVIDERS_DLL)
     install(FILES "${ONNXRUNTIME_PROVIDERS_DLL}" DESTINATION .)
 endif()
 
+# ── CPack / Installer ───────────────────────────────────────
+# Generates:
+#   NSIS  → KeyboardSwitcher-1.2.2-win64.exe  (installer wizard)
+#   ZIP   → KeyboardSwitcher-1.2.2-win64.zip  (portable archive)
+#
+# Usage (from the release build directory):
+#   cpack -G NSIS   — requires NSIS installed (https://nsis.sourceforge.io)
+#   cpack -G ZIP    — no extra tools needed
+set(CPACK_PACKAGE_NAME "KeyboardSwitcher")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VENDOR "KeyboardSwitcher")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Automatic keyboard language switcher (En / He / Ru)")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "KeyboardSwitcher")
 
+# License shown in the installer wizard
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE")
 
+# NSIS-specific settings
+set(CPACK_NSIS_DISPLAY_NAME "Keyboard Switcher ${PROJECT_VERSION}")
+set(CPACK_NSIS_PACKAGE_NAME "Keyboard Switcher")
+set(CPACK_NSIS_INSTALLED_ICON_NAME "KeyboardSwitcher.exe")
+set(CPACK_NSIS_MUI_ICON "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico")
+set(CPACK_NSIS_MUI_UNIICON "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico")
+set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+
+# Start-menu shortcut
+set(CPACK_NSIS_CREATE_ICONS_EXTRA
+    "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Keyboard Switcher.lnk' '$INSTDIR\\\\KeyboardSwitcher.exe'")
+set(CPACK_NSIS_DELETE_ICONS_EXTRA
+    "Delete '$SMPROGRAMS\\\\$START_MENU\\\\Keyboard Switcher.lnk'")
+
+# Default generators: NSIS installer + portable ZIP
+set(CPACK_GENERATOR "NSIS;ZIP")
+
+include(CPack)
