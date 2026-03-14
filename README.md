@@ -210,4 +210,4 @@ new, unsigned application.
 Pull requests are welcome!
 
 ## License
-This project is licensed under the MIT License.
+This project is licensed under the MIT License — Copyright © 2025-2026 Alpha-Numerical.

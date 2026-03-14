@@ -189,7 +189,7 @@ endif()
 #   cpack -G ZIP    — no extra tools needed
 set(CPACK_PACKAGE_NAME "KeyboardSwitcher")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_VENDOR "KeyboardSwitcher")
+set(CPACK_PACKAGE_VENDOR "Alpha-Numerical")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Automatic keyboard language switcher (En / He / Ru)")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "KeyboardSwitcher")
