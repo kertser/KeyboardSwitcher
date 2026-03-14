@@ -2,6 +2,8 @@
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
+[Download Latest Release](https://github.com/kertser/KeyboardSwitcher/releases/latest)
+
 ## Table of Contents
 - [Project Description](#project-description)
 - [Features](#features)
