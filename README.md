@@ -179,25 +179,6 @@ cpack -G ZIP        # portable archive
 cpack -G NSIS       # installer (requires NSIS)
 ```
 
-## Windows Defender / SmartScreen
-
-Windows may show a **"Windows protected your PC"** warning on first run because the
-executable is unsigned and has no download reputation yet. This is expected for any
-new, unsigned application.
-
-**What is already in place:**
-- The `.exe` embeds a full **VERSIONINFO** resource (company name, product name,
-  version, copyright). This helps Defender heuristics and makes the binary look
-  legitimate in *Properties → Details*.
-
-**To further reduce or eliminate warnings:**
-
-| Approach | Cost | Effect |
-|---|---|---|
-| **Submit to Microsoft** for analysis | Free | Upload the `.exe` at [Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission) to request whitelisting. Takes a few days. |
-| **Code-signing certificate** | ~\$70–\$400 /year | A signed binary is trusted immediately. An **EV certificate** builds instant SmartScreen reputation. |
-| **Build reputation over time** | Free | The more users run the app, the faster SmartScreen stops warning. |
-
 ## Usage
 1. Run the program — it appears as a tray icon.
 2. Click on a text area and start typing.
