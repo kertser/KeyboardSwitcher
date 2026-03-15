@@ -200,19 +200,24 @@ class DetectionHistory:
 # ============================================================
 def typo_resilient_detect(
     text_variants: list,
-    required_confidence: float,
+    current_lang: str,
+    num_chars: int,
     history: DetectionHistory,
     ort_session, char_to_index, max_length,
     *,
     enable_typo_resilience: bool = True,
-    consecutive_agreement_count: int = 2,
-    borderline_zone_factor: float = 0.85,
 ) -> Optional[DetectionResult]:
-    """Run detection across layout variants with typo resilience.
+    """Run detection across layout variants with per-pair adaptive params.
+
+    After finding the best candidate language, looks up the (current_lang →
+    best_lang) pair parameters to determine the required confidence threshold
+    and other settings.
 
     Tier 1 — consecutive-agreement gate (zero extra model calls).
     Tier 2 — drop-one confidence boosting (borderline zone only).
     """
+    import config  # local import to avoid circular dependency
+
     best_lang = None
     best_conf = 0.0
     best_variant = ""
@@ -228,10 +233,20 @@ def typo_resilient_detect(
         history.update("", 0.0)
         return None
 
+    # --- Look up per-pair switching parameters ---
+    params = config.get_params_for_pair(current_lang, best_lang)
+    required_confidence = params.get_required_confidence(num_chars)
+
+    # Per-pair min-chars check: the pair may require more characters
+    # than the global minimum used as the early-out in the caller.
+    if num_chars < params.EarlyDetectionMinChars:
+        history.update(best_lang, best_conf)
+        return None
+
     # --- Tier 2: Drop-one boosting (borderline zone) ---
     if (enable_typo_resilience and
             best_conf < required_confidence and
-            best_conf >= required_confidence * borderline_zone_factor and
+            best_conf >= required_confidence * params.BorderlineZoneFactor and
             len(best_variant) > 2):
         for i in range(len(best_variant)):
             dropped = best_variant[:i] + best_variant[i + 1:]
@@ -244,7 +259,7 @@ def typo_resilient_detect(
 
     # --- Tier 1: Consecutive-agreement gate ---
     if enable_typo_resilience:
-        if not history.is_consistent(best_lang, consecutive_agreement_count):
+        if not history.is_consistent(best_lang, params.ConsecutiveAgreementCount):
             return None
 
     if best_conf >= required_confidence:

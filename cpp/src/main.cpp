@@ -321,10 +321,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         cacheSize >= static_cast<size_t>(Config::EarlyDetectionMinChars) &&
         g_detector)
     {
-        // Compute the confidence bar for the current text length.
-        // Short text → very high bar; longer text → lower bar.
-        float requiredConfidence = Config::GetRequiredConfidence(cacheSize);
-
+        // Note: per-pair parameters may require more chars than the global
+        // default minimum.  The global check here is a fast early-out;
+        // TypoResilientDetect performs the pair-specific min-chars check
+        // after it determines the best candidate language.
+        std::string currentLangId = GetCurrentKeyboardLayout();
         std::wstring text = g_cache.GetText();
 
         // Edge-case filter: skip detection for URLs, paths, mostly non-alpha
@@ -368,12 +369,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             }
 
             // Typo-resilient detection: consecutive agreement + drop-one boosting
+            // Uses per-language-pair parameters for confidence thresholds.
             auto detection = TypoResilientDetect(
-                *g_detector, textVariants, requiredConfidence, g_history);
+                *g_detector, textVariants, currentLangId, cacheSize, g_history);
 
             if (detection.has_value()) {
                 const std::string& bestLang = detection->language;
-                std::string currentLangId = GetCurrentKeyboardLayout();
                 bool didCorrection = false;
 
                 if (currentLangId != bestLang) {

@@ -8,18 +8,10 @@ namespace Config {
     std::atomic<bool> alt_pressed{false};
     std::string LastSetting = "en";
 
-    // ── Adaptive confidence curve parameters ──
-    int   EarlyDetectionMinChars = 3;      // earliest detection fires here
-    int   FullConfidenceChars    = 10;     // confidence floor kicks in here
-    float ConfidenceAtMinChars   = 0.97f;  // near-certainty at few chars
-    float ConfidenceAtMaxChars   = 0.55f;  // relaxed after enough chars
-
-    // ── Typo resilience defaults ──
-    int   ConsecutiveAgreementCount = 2;
-    float BorderlineZoneFactor      = 0.85f;
-    bool  EnableTypoResilience      = true;
-
-    float GetRequiredConfidence(size_t numChars) {
+    // ================================================================
+    // SwitchingParams – per-pair adaptive confidence curve
+    // ================================================================
+    float SwitchingParams::GetRequiredConfidence(size_t numChars) const {
         int n = static_cast<int>(numChars);
         if (n < EarlyDetectionMinChars)
             return 1.1f;                       // impossible → no detection
@@ -31,6 +23,71 @@ namespace Config {
                 / static_cast<float>(FullConfidenceChars - EarlyDetectionMinChars);
         return ConfidenceAtMinChars + t * (ConfidenceAtMaxChars - ConfidenceAtMinChars);
     }
+
+    // ── Global default parameters ──────────────────────────────────
+    SwitchingParams DefaultParams = {
+        /* EarlyDetectionMinChars  */ 3,
+        /* FullConfidenceChars     */ 10,
+        /* ConfidenceAtMinChars    */ 0.97f,
+        /* ConfidenceAtMaxChars    */ 0.55f,
+        /* ConsecutiveAgreementCount */ 2,
+        /* BorderlineZoneFactor    */ 0.85f,
+    };
+
+    // ── Per-pair overrides ─────────────────────────────────────────
+    // Different language pairs have different detection characteristics:
+    //
+    //  en↔ru : Distinct scripts (Latin vs Cyrillic). The model is very
+    //          confident even on short input → standard defaults work.
+    //
+    //  en↔he : Distinct scripts (Latin vs Hebrew). Hebrew has no upper-
+    //          case, so typed-on-English is always lowercase — slightly
+    //          easier to confuse with short English. Require a bit more
+    //          confidence at short lengths.
+    //
+    //  ru↔he : Both non-Latin. Physical key positions overlap less, and
+    //          the model may need more context. Slightly higher min-chars
+    //          and confidence give more room to discriminate.
+    //
+    // Pairs not listed here automatically fall back to DefaultParams.
+    // To keep all pairs at defaults, simply leave PairOverrides empty.
+    std::map<LangPair, SwitchingParams> PairOverrides = {
+        // ── English ↔ Russian ─── (standard — same as default)
+        { {"en", "ru"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
+        { {"ru", "en"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
+
+        // ── English ↔ Hebrew ─── (slightly stricter at short lengths)
+        { {"en", "he"}, { 3, 10, 0.98f, 0.60f, 2, 0.85f } },
+        { {"he", "en"}, { 3, 10, 0.98f, 0.60f, 2, 0.85f } },
+
+        // ── Russian ↔ Hebrew ─── (both non-Latin; need more context)
+        { {"ru", "he"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
+        { {"he", "ru"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
+    };
+
+    const SwitchingParams& GetParamsForPair(const std::string& fromLang,
+                                            const std::string& toLang) {
+        auto it = PairOverrides.find({fromLang, toLang});
+        if (it != PairOverrides.end())
+            return it->second;
+        return DefaultParams;
+    }
+
+    // ── Legacy global aliases (point into DefaultParams) ───────────
+    int&   EarlyDetectionMinChars   = DefaultParams.EarlyDetectionMinChars;
+    int&   FullConfidenceChars      = DefaultParams.FullConfidenceChars;
+    float& ConfidenceAtMinChars     = DefaultParams.ConfidenceAtMinChars;
+    float& ConfidenceAtMaxChars     = DefaultParams.ConfidenceAtMaxChars;
+    int&   ConsecutiveAgreementCount = DefaultParams.ConsecutiveAgreementCount;
+    float& BorderlineZoneFactor     = DefaultParams.BorderlineZoneFactor;
+
+    // Convenience wrapper using the global default
+    float GetRequiredConfidence(size_t numChars) {
+        return DefaultParams.GetRequiredConfidence(numChars);
+    }
+
+    // ── Typo resilience master toggle ──
+    bool  EnableTypoResilience = true;
 
     // Language codes: HKL values matching the Python project
     const std::unordered_map<std::string, HKL> LANGUAGE_CODES = {

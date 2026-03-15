@@ -81,10 +81,14 @@ std::wstring ConvertTextBidirectional(const std::wstring& text,
 // Runs detection across all layout variants, applies:
 //   Tier 1 — consecutive-agreement gate
 //   Tier 2 — drop-one confidence boosting (borderline zone only)
+// Uses per-language-pair parameters: after finding the best candidate
+// language, looks up the (currentLang → bestLang) pair params to
+// determine the required confidence threshold and other settings.
 // Returns a DetectionResult if confident enough, or nullopt.
 std::optional<DetectionResult> TypoResilientDetect(
     LanguageDetector& detector,
     const std::vector<std::wstring>& textVariants,
-    float requiredConfidence,
+    const std::string& currentLang,
+    size_t numChars,
     DetectionHistory& history);
 

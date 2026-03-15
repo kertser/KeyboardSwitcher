@@ -334,7 +334,8 @@ void DetectionHistory::Clear() {
 std::optional<DetectionResult> TypoResilientDetect(
     LanguageDetector& detector,
     const std::vector<std::wstring>& textVariants,
-    float requiredConfidence,
+    const std::string& currentLang,
+    size_t numChars,
     DetectionHistory& history)
 {
     // --- Standard best-variant detection (same as before) ---
@@ -356,13 +357,24 @@ std::optional<DetectionResult> TypoResilientDetect(
         return std::nullopt;
     }
 
+    // --- Look up per-pair switching parameters ---
+    const auto& params = Config::GetParamsForPair(currentLang, bestLang);
+    float requiredConfidence = params.GetRequiredConfidence(numChars);
+
+    // Per-pair min-chars check: the pair may require more characters
+    // than the global minimum that was used as the early-out in the caller.
+    if (static_cast<int>(numChars) < params.EarlyDetectionMinChars) {
+        history.Update(bestLang, bestConf);
+        return std::nullopt;
+    }
+
     // --- Tier 2: Drop-one boosting (borderline zone) ---
     // If the confidence is close to but below the threshold, a single typo
     // character may be dragging it down.  Try removing each character once
     // and see if confidence jumps above the threshold.
     if (Config::EnableTypoResilience &&
         bestConf < requiredConfidence &&
-        bestConf >= requiredConfidence * Config::BorderlineZoneFactor &&
+        bestConf >= requiredConfidence * params.BorderlineZoneFactor &&
         bestVariant.size() > 2)
     {
         for (size_t i = 0; i < bestVariant.size(); ++i) {
@@ -386,7 +398,7 @@ std::optional<DetectionResult> TypoResilientDetect(
     // agree before committing.  This is free (no extra model calls) and
     // prevents a single-typo from triggering a spurious switch.
     if (Config::EnableTypoResilience) {
-        if (!history.IsConsistent(bestLang, Config::ConsecutiveAgreementCount)) {
+        if (!history.IsConsistent(bestLang, params.ConsecutiveAgreementCount)) {
             // Not enough agreement yet — keep accumulating.
             return std::nullopt;
         }

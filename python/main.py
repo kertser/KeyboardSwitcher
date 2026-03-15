@@ -274,7 +274,11 @@ def background_task(cache):
         if (config.SEARCH and
                 cache_size >= config.EarlyDetectionMinChars):
 
-            required_confidence = config.get_required_confidence(cache_size)
+            # Note: per-pair parameters may require more chars than the
+            # global minimum.  The global check here is a fast early-out;
+            # typo_resilient_detect performs the pair-specific check after
+            # it determines the best candidate language.
+            current_lang_id = get_keyboard_layout()
             text = cache.get_text()
 
             if not should_skip_detection(text):
@@ -292,17 +296,15 @@ def background_task(cache):
                 text_variants = deduplicate_ordered(text_variants)
 
                 # Typo-resilient detection: consecutive agreement + drop-one boosting
+                # Uses per-language-pair parameters for confidence thresholds.
                 detection = typo_resilient_detect(
-                    text_variants, required_confidence, history,
+                    text_variants, current_lang_id, cache_size, history,
                     *model_parameters,
                     enable_typo_resilience=config.EnableTypoResilience,
-                    consecutive_agreement_count=config.ConsecutiveAgreementCount,
-                    borderline_zone_factor=config.BorderlineZoneFactor,
                 )
 
                 if detection is not None:
                     best_lang = detection.language
-                    current_lang_id = get_keyboard_layout()
                     did_correction = False
 
                     if current_lang_id != best_lang:

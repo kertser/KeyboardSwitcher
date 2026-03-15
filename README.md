@@ -38,6 +38,7 @@ via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
+| **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
 | **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
 | **Per-window language memory** | Remembers the language for each window and restores it on focus change |
 | **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), detection is paused until the next mouse click |
@@ -65,6 +66,7 @@ KeyboardSwitcher/
 │   └── vocabulary/
 ├── cpp/                     # C++ (Win32) implementation
 │   ├── CMakeLists.txt
+│   ├── build_release.bat    # One-click release build & package script
 │   ├── lang_model.onnx
 │   ├── dictionary.json
 │   ├── keyboard.ico
@@ -172,10 +174,19 @@ The **NSIS installer** provides a standard Windows setup wizard with:
 The **ZIP** is a portable archive — just extract and run.
 
 ### Full example (build + package):
+
+**One-click script** (recommended):
+```bash
+cd cpp
+build_release.bat
+```
+
+Or manually:
 ```bash
 cd cpp
 cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
 cmake --build cmake-build-release --config Release
+cmake --install cmake-build-release --prefix ./dist
 cd cmake-build-release
 cpack -G ZIP        # portable archive
 cpack -G NSIS       # installer (requires NSIS)
