@@ -7,8 +7,12 @@
 
 namespace Config {
 
-    // Application version
-    constexpr const wchar_t* VERSION = L"1.2.2";
+    // Application version — injected by CMake from project(VERSION ...)
+    // Change the version only in CMakeLists.txt; it propagates everywhere.
+#ifndef APP_VERSION_STRING
+#define APP_VERSION_STRING L"0.0.0"   // fallback if built without CMake
+#endif
+    constexpr const wchar_t* VERSION = APP_VERSION_STRING;
 
     // Global flags (atomic for thread safety)
     extern std::atomic<bool> EnableSwitcher;

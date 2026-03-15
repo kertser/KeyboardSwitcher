@@ -1,5 +1,5 @@
 # Application version (keep in sync with C++ Config.h)
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 EnableSwitcher = True # Enable switching between languages
 SEARCH = False # Disable search functionality until a language is selected

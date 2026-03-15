@@ -1,4 +1,4 @@
-# KeyboardSwitcher – Python implementation (synced with C++ v1.2.0)
+# KeyboardSwitcher – Python implementation (synced with C++ v1.2.3)
 #
 # Importing the necessary packages
 import threading

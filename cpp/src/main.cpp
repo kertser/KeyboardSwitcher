@@ -573,6 +573,14 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // WinMain - application entry point
 // ============================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // ---- Single-instance guard (named mutex) ----
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\KeyboardSwitcher_SingleInstance");
+    if (hMutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+        // Another instance is already running — exit silently
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
+
     // Get executable directory for locating data files
     std::wstring exeDir = GetExeDirectory();
     std::wstring modelPath = exeDir + L"\\lang_model.onnx";
@@ -647,6 +655,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (g_mouseHook)    UnhookWindowsHookEx(g_mouseHook);
     g_detector = nullptr;
     g_windows  = nullptr;
+
+    // Release single-instance mutex
+    if (hMutex) {
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
+    }
 
     return static_cast<int>(msg.wParam);
 }

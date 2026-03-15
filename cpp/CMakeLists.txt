@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(KeyboardSwitcher VERSION 1.2.2 LANGUAGES CXX)
+project(KeyboardSwitcher VERSION 1.2.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -109,7 +109,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     comctl32
 )
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE UNICODE _UNICODE)
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    UNICODE _UNICODE
+    APP_VERSION_STRING=L"${PROJECT_VERSION}"
+)
 
 # ── Static-link MinGW runtimes so no libstdc++/libgcc DLLs needed ──
 if(MINGW)
@@ -180,9 +183,9 @@ if(ONNXRUNTIME_PROVIDERS_DLL)
 endif()
 
 # ── CPack / Installer ───────────────────────────────────────
-# Generates:
-#   NSIS  → KeyboardSwitcher-1.2.2-win64.exe  (installer wizard)
-#   ZIP   → KeyboardSwitcher-1.2.2-win64.zip  (portable archive)
+# Generates (version from PROJECT_VERSION):
+#   NSIS  → KeyboardSwitcher-<version>-win64.exe  (installer wizard)
+#   ZIP   → KeyboardSwitcher-<version>-win64.zip  (portable archive)
 #
 # Usage (from the release build directory):
 #   cpack -G NSIS   — requires NSIS installed (https://nsis.sourceforge.io)
