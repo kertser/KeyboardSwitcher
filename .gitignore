@@ -201,3 +201,4 @@ cython_debug/
 /cpp/dist/
 .idea/
 /AGENTS.md
+/cpp/release/
