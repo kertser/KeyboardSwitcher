@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <strsafe.h>
 
 #include <string>
@@ -468,12 +469,229 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
 }
 
 // ============================================================
+// Confidence Flyout Panel (appears near the tray icon)
+// ============================================================
+static const wchar_t CONF_FLYOUT_CLASS[] = L"KS_ConfFlyout";
+static HWND g_hConfFlyout = nullptr;
+
+// Compile-time defaults for Reset
+static constexpr float ORIG_CONF_AT_MIN_CHARS = 0.97f;
+static constexpr float ORIG_CONF_AT_MAX_CHARS = 0.55f;
+
+struct ConfFlyoutControls {
+    HWND hSliderMin = nullptr;
+    HWND hSliderMax = nullptr;
+    HWND hLabelMin  = nullptr;
+    HWND hLabelMax  = nullptr;
+};
+static ConfFlyoutControls g_fly;
+
+static void UpdateSliderLabel(HWND hLabel, int sliderValue) {
+    wchar_t buf[16];
+    swprintf_s(buf, L"%.2f", sliderValue / 100.0f);
+    SetWindowTextW(hLabel, buf);
+}
+
+static void ApplyConfidenceFromSliders() {
+    float minC = SendMessage(g_fly.hSliderMin, TBM_GETPOS, 0, 0) / 100.0f;
+    float maxC = SendMessage(g_fly.hSliderMax, TBM_GETPOS, 0, 0) / 100.0f;
+    Config::DefaultParams.ConfidenceAtMinChars = minC;
+    Config::DefaultParams.ConfidenceAtMaxChars = maxC;
+    for (auto& [pair, params] : Config::PairOverrides) {
+        params.ConfidenceAtMinChars = minC;
+        params.ConfidenceAtMaxChars = maxC;
+    }
+}
+
+// Ensure short-text confidence ≥ long-text confidence at all times.
+static void EnforceSliderConstraint(HWND changedSlider) {
+    int minVal = static_cast<int>(SendMessage(g_fly.hSliderMin, TBM_GETPOS, 0, 0));
+    int maxVal = static_cast<int>(SendMessage(g_fly.hSliderMax, TBM_GETPOS, 0, 0));
+
+    if (changedSlider == g_fly.hSliderMin && minVal < maxVal) {
+        SendMessage(g_fly.hSliderMax, TBM_SETPOS, TRUE, minVal);
+        UpdateSliderLabel(g_fly.hLabelMax, minVal);
+    } else if (changedSlider == g_fly.hSliderMax && maxVal > minVal) {
+        SendMessage(g_fly.hSliderMin, TBM_SETPOS, TRUE, maxVal);
+        UpdateSliderLabel(g_fly.hLabelMin, maxVal);
+    }
+}
+
+static LRESULT CALLBACK ConfFlyoutWndProc(HWND hwnd, UINT msg,
+                                           WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hInst = GetModuleHandle(nullptr);
+        HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        const int pad = 12;
+        const int cw  = 296;   // usable content width
+        int y = 10;
+
+        // ── Row 1: Confidence at short text ──
+        HWND hS1 = CreateWindowExW(0, L"STATIC",
+            L"Confidence (short text):",
+            WS_CHILD | WS_VISIBLE, pad, y, 210, 16,
+            hwnd, nullptr, hInst, nullptr);
+        SendMessage(hS1, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        g_fly.hLabelMin = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            pad + cw - 42, y, 42, 16,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LABEL_MIN_CONF)),
+            hInst, nullptr);
+        SendMessage(g_fly.hLabelMin, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        y += 18;
+        g_fly.hSliderMin = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
+            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+            pad, y, cw, 25,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SLIDER_MIN_CONF)),
+            hInst, nullptr);
+        SendMessage(g_fly.hSliderMin, TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
+        int initMin = static_cast<int>(Config::ConfidenceAtMinChars * 100 + 0.5f);
+        SendMessage(g_fly.hSliderMin, TBM_SETPOS, TRUE, initMin);
+        UpdateSliderLabel(g_fly.hLabelMin, initMin);
+
+        // ── Row 2: Confidence at long text ──
+        y += 32;
+        HWND hS2 = CreateWindowExW(0, L"STATIC",
+            L"Confidence (long text):",
+            WS_CHILD | WS_VISIBLE, pad, y, 210, 16,
+            hwnd, nullptr, hInst, nullptr);
+        SendMessage(hS2, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        g_fly.hLabelMax = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            pad + cw - 42, y, 42, 16,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LABEL_MAX_CONF)),
+            hInst, nullptr);
+        SendMessage(g_fly.hLabelMax, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        y += 18;
+        g_fly.hSliderMax = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
+            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+            pad, y, cw, 25,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SLIDER_MAX_CONF)),
+            hInst, nullptr);
+        SendMessage(g_fly.hSliderMax, TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
+        int initMax = static_cast<int>(Config::ConfidenceAtMaxChars * 100 + 0.5f);
+        SendMessage(g_fly.hSliderMax, TBM_SETPOS, TRUE, initMax);
+        UpdateSliderLabel(g_fly.hLabelMax, initMax);
+
+        // ── Reset button ──
+        y += 34;
+        HWND hReset = CreateWindowExW(0, L"BUTTON", L"Reset Defaults",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            (320 - 110) / 2, y, 110, 26,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_RESET)),
+            hInst, nullptr);
+        SendMessage(hReset, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        return 0;
+    }
+
+    case WM_HSCROLL: {
+        HWND hCtrl = reinterpret_cast<HWND>(lParam);
+        if (hCtrl == g_fly.hSliderMin) {
+            UpdateSliderLabel(g_fly.hLabelMin,
+                static_cast<int>(SendMessage(g_fly.hSliderMin, TBM_GETPOS, 0, 0)));
+            EnforceSliderConstraint(g_fly.hSliderMin);
+        } else if (hCtrl == g_fly.hSliderMax) {
+            UpdateSliderLabel(g_fly.hLabelMax,
+                static_cast<int>(SendMessage(g_fly.hSliderMax, TBM_GETPOS, 0, 0)));
+            EnforceSliderConstraint(g_fly.hSliderMax);
+        }
+        ApplyConfidenceFromSliders();
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_BTN_RESET) {
+            int defMin = static_cast<int>(ORIG_CONF_AT_MIN_CHARS * 100 + 0.5f);
+            int defMax = static_cast<int>(ORIG_CONF_AT_MAX_CHARS * 100 + 0.5f);
+            SendMessage(g_fly.hSliderMin, TBM_SETPOS, TRUE, defMin);
+            SendMessage(g_fly.hSliderMax, TBM_SETPOS, TRUE, defMax);
+            UpdateSliderLabel(g_fly.hLabelMin, defMin);
+            UpdateSliderLabel(g_fly.hLabelMax, defMax);
+            ApplyConfidenceFromSliders();
+        }
+        return 0;
+
+    case WM_ACTIVATE:
+        // Auto-dismiss when the user clicks away
+        if (LOWORD(wParam) == WA_INACTIVE)
+            DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        g_hConfFlyout = nullptr;
+        g_fly = {};
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowConfidenceFlyout() {
+    // Toggle: if already open, close it
+    if (g_hConfFlyout) {
+        DestroyWindow(g_hConfFlyout);
+        return;
+    }
+
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = ConfFlyoutWndProc;
+        wc.hInstance      = hInst;
+        wc.hbrBackground  = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName  = CONF_FLYOUT_CLASS;
+        wc.hCursor        = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassExW(&wc);
+        classRegistered = true;
+    }
+
+    const int w = 320, h = 170;
+
+    // Position the flyout just above the cursor (tray icon area)
+    POINT pt;
+    GetCursorPos(&pt);
+    int x = pt.x - w / 2;
+    int y = pt.y - h - 4;
+
+    // Clamp to work area so it never goes off-screen
+    RECT wa;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    if (x < wa.left)         x = wa.left;
+    if (x + w > wa.right)    x = wa.right - w;
+    if (y < wa.top)          y = wa.top;
+    if (y + h > wa.bottom)   y = wa.bottom - h;
+
+    g_hConfFlyout = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        CONF_FLYOUT_CLASS, nullptr,
+        WS_POPUP | WS_BORDER,
+        x, y, w, h,
+        g_hwndHidden, nullptr, hInst, nullptr);
+
+    ShowWindow(g_hConfFlyout, SW_SHOW);
+    SetForegroundWindow(g_hConfFlyout);
+}
+
+// ============================================================
 // Hidden window procedure (tray icon messages + context menu)
 // ============================================================
 static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+        // Left-click: toggle confidence flyout
+        if (lParam == WM_LBUTTONUP) {
+            ShowConfidenceFlyout();
+        }
+        // Right-click: context menu
+        else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hwnd);
@@ -493,24 +711,6 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     | (Config::EnableTypoResilience ? MF_CHECKED : MF_UNCHECKED)
                     | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
                     ID_TRAY_TYPO_RESILIENCE, L"Typo Resilience");
-
-                // Min Chars Before Detection submenu
-                HMENU hSubMenu = CreatePopupMenu();
-                if (hSubMenu) {
-                    int cur = Config::EarlyDetectionMinChars;
-                    AppendMenuW(hSubMenu,
-                        MF_STRING | (cur == 3 ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_MINCHARS_3, L"3 characters");
-                    AppendMenuW(hSubMenu,
-                        MF_STRING | (cur == 4 ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_MINCHARS_4, L"4 characters");
-                    AppendMenuW(hSubMenu,
-                        MF_STRING | (cur == 5 ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_MINCHARS_5, L"5 characters");
-                    AppendMenuW(hMenu,
-                        MF_POPUP | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
-                        (UINT_PTR)hSubMenu, L"Min Chars Before Detection");
-                }
 
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"About");
@@ -534,15 +734,6 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_TYPO_RESILIENCE:
             Config::EnableTypoResilience = !Config::EnableTypoResilience;
-            break;
-        case ID_TRAY_MINCHARS_3:
-            Config::EarlyDetectionMinChars = 3;
-            break;
-        case ID_TRAY_MINCHARS_4:
-            Config::EarlyDetectionMinChars = 4;
-            break;
-        case ID_TRAY_MINCHARS_5:
-            Config::EarlyDetectionMinChars = 5;
             break;
         case ID_TRAY_ABOUT:
             g_trayIcon.ShowBalloon((std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
@@ -574,6 +765,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // WinMain - application entry point
 // ============================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // ---- Common controls (trackbar for confidence sliders) ----
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icex);
+
     // ---- Single-instance guard (named mutex) ----
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\KeyboardSwitcher_SingleInstance");
     if (hMutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {

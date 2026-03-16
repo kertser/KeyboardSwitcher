@@ -200,3 +200,4 @@ cython_debug/
 /cpp/cmake-build-release/
 /cpp/dist/
 .idea/
+/AGENTS.md
