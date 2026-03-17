@@ -405,24 +405,28 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     }
 
                     g_isSendingInput.store(true);
+                    // Block physical keyboard/mouse input for the duration
+                    // of the correction.  BlockInput() only blocks hardware
+                    // events — our SendInput() calls are still delivered.
+                    BOOL blocked = BlockInput(TRUE);
 
                     // Current keystroke not delivered yet; erase N-1 on screen
                     if (cacheLen > 1)
                         SendBackspaces(cacheLen - 1);
 
                     // Change keyboard layout to the detected language
+                    // (SendMessage is synchronous — layout is active on return)
                     ChangeKeyboardLayout(bestLang);
                     if (g_windows) {
                         g_windows->SetActiveWindowLanguage(bestLang);
                     }
                     Config::LastSetting = bestLang;
 
-                    Sleep(20); // Brief wait for layout change to propagate
-
-                    // Re-type the full corrected text
+                    // Re-type the full corrected text (KEYEVENTF_UNICODE — layout-independent)
                     std::vector<wchar_t> correctedChars(correctedText.begin(), correctedText.end());
                     SendString(correctedChars);
 
+                    if (blocked) BlockInput(FALSE);
                     g_isSendingInput.store(false);
                     didCorrection = true;
                     UpdateTrayTooltip();
