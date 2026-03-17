@@ -254,11 +254,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         std::thread([]() {
             Sleep(500);
             std::string currentLayout = GetCurrentKeyboardLayout();
+            std::string windowLang;
             if (g_windows) {
-                std::string windowLang = g_windows->GetActiveWindowLanguage();
+                windowLang = g_windows->GetActiveWindowLanguage();
                 if (Config::SaveWindowState.load()) {
                     if (windowLang.empty()) {
-                        // First visit — just record the current layout
                         g_windows->SetActiveWindowLanguage(currentLayout);
                         Config::LastSetting = currentLayout;
                     } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
@@ -272,7 +272,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             }
             g_cache.Clear();
             g_history.Clear();
-            Config::SEARCH.store(true);
+            // When SaveWindowState is on and the window already has a
+            // known language, skip re-detection — the language was already
+            // decided.  Otherwise start a fresh detection frame.
+            if (!Config::SaveWindowState.load() || windowLang.empty()) {
+                Config::SEARCH.store(true);
+            }
             UpdateTrayTooltip();
         }).detach();
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
@@ -459,22 +464,30 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
     if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) {
         g_cache.Clear();
         g_history.Clear();
-        Config::SEARCH.store(true);
 
         std::string currentLayout = GetCurrentKeyboardLayout();
-        if (g_windows && Config::SaveWindowState.load()) {
-            std::string windowLang = g_windows->GetActiveWindowLanguage();
-            if (windowLang.empty()) {
-                // First visit — just record the current layout
-                g_windows->SetActiveWindowLanguage(currentLayout);
-                Config::LastSetting = currentLayout;
-            } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
-                g_windows->SetActiveWindowLanguage(currentLayout);
-                Config::LastSetting = currentLayout;
-            } else {
-                ChangeKeyboardLayout(windowLang);
-                Config::LastSetting = windowLang;
+        std::string windowLang;
+        if (g_windows) {
+            windowLang = g_windows->GetActiveWindowLanguage();
+            if (Config::SaveWindowState.load()) {
+                if (windowLang.empty()) {
+                    g_windows->SetActiveWindowLanguage(currentLayout);
+                    Config::LastSetting = currentLayout;
+                } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
+                    g_windows->SetActiveWindowLanguage(currentLayout);
+                    Config::LastSetting = currentLayout;
+                } else {
+                    ChangeKeyboardLayout(windowLang);
+                    Config::LastSetting = windowLang;
+                }
             }
+        }
+
+        // When SaveWindowState is on and the window already has a
+        // known language, skip re-detection — the language was already
+        // decided.  Otherwise start a fresh detection frame.
+        if (!Config::SaveWindowState.load() || windowLang.empty()) {
+            Config::SEARCH.store(true);
         }
         UpdateTrayTooltip();
     }
