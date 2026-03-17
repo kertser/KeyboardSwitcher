@@ -7,9 +7,10 @@
 
 class WindowTracker {
 public:
-    explicit WindowTracker(const std::string& defaultLanguage);
+    WindowTracker() = default;
 
-    // Get the language for the currently active window
+    // Get the language for the currently active window.
+    // Returns "" if the window has not been visited yet.
     std::string GetActiveWindowLanguage();
 
     // Set the language for the currently active window
@@ -20,6 +21,5 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    std::string defaultLanguage_;
     std::unordered_map<HWND, std::string> windowLanguages_;
 };

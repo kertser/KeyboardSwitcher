@@ -1,24 +1,18 @@
 #include "WindowTracker.h"
 #include "Config.h"
 
-WindowTracker::WindowTracker(const std::string& defaultLanguage)
-    : defaultLanguage_(defaultLanguage)
-{
-}
-
 std::string WindowTracker::GetActiveWindowLanguage() {
     std::lock_guard<std::mutex> lock(mutex_);
     HWND hwnd = GetForegroundWindow();
     if (hwnd == nullptr) {
-        return defaultLanguage_;
+        return "";
     }
     auto it = windowLanguages_.find(hwnd);
     if (it != windowLanguages_.end()) {
         return it->second;
     }
-    // Window not tracked yet, assign default
-    windowLanguages_[hwnd] = defaultLanguage_;
-    return defaultLanguage_;
+    // Window not tracked yet — return empty so callers know it's unvisited
+    return "";
 }
 
 void WindowTracker::SetActiveWindowLanguage(const std::string& language) {

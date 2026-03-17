@@ -257,11 +257,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             if (g_windows) {
                 std::string windowLang = g_windows->GetActiveWindowLanguage();
                 if (Config::SaveWindowState.load()) {
-                    if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
+                    if (windowLang.empty()) {
+                        // First visit — just record the current layout
+                        g_windows->SetActiveWindowLanguage(currentLayout);
+                        Config::LastSetting = currentLayout;
+                    } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
                         g_windows->SetActiveWindowLanguage(currentLayout);
                         Config::LastSetting = currentLayout;
                     } else {
-                        if (windowLang.empty()) windowLang = Config::LastSetting;
                         ChangeKeyboardLayout(windowLang);
                         Config::LastSetting = windowLang;
                     }
@@ -284,7 +287,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     std::string currentLayout = GetCurrentKeyboardLayout();
     if (g_windows) {
         std::string windowLang = g_windows->GetActiveWindowLanguage();
-        if (windowLang != currentLayout) {
+        if (windowLang.empty()) {
+            // First visit to this window — just record the current layout
+            g_windows->SetActiveWindowLanguage(currentLayout);
+            Config::LastSetting = currentLayout;
+        } else if (windowLang != currentLayout) {
             if (Config::SaveWindowState.load()) {
                 g_windows->SetActiveWindowLanguage(currentLayout);
                 Config::LastSetting = currentLayout;
@@ -453,11 +460,14 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         std::string currentLayout = GetCurrentKeyboardLayout();
         if (g_windows && Config::SaveWindowState.load()) {
             std::string windowLang = g_windows->GetActiveWindowLanguage();
-            if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
+            if (windowLang.empty()) {
+                // First visit — just record the current layout
+                g_windows->SetActiveWindowLanguage(currentLayout);
+                Config::LastSetting = currentLayout;
+            } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
                 g_windows->SetActiveWindowLanguage(currentLayout);
                 Config::LastSetting = currentLayout;
             } else {
-                if (windowLang.empty()) windowLang = Config::LastSetting;
                 ChangeKeyboardLayout(windowLang);
                 Config::LastSetting = windowLang;
             }
@@ -793,10 +803,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
     g_detector = detector.get();
 
-    // Initialize the window tracker with the current keyboard layout
-    std::string initialLang = GetCurrentKeyboardLayout();
-    auto windowTracker = std::make_unique<WindowTracker>(initialLang);
+    // Initialize the window tracker (no default language — each window
+    // is unvisited until the user first interacts with it)
+    auto windowTracker = std::make_unique<WindowTracker>();
     g_windows = windowTracker.get();
+    std::string initialLang = GetCurrentKeyboardLayout();
     Config::LastSetting = initialLang;
 
     // Register hidden window class
