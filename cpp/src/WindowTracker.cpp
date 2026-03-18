@@ -14,6 +14,19 @@ void WindowTracker::SetLanguage(HWND hwnd, size_t titleHash, const std::string& 
     windowLanguages_[hwnd][titleHash] = language;
 }
 
+void WindowTracker::ClearOtherContexts(HWND hwnd, size_t keepContextHash) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto wit = windowLanguages_.find(hwnd);
+    if (wit == windowLanguages_.end()) return;
+    for (auto it = wit->second.begin(); it != wit->second.end();) {
+        if (it->first != keepContextHash) {
+            it = wit->second.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void WindowTracker::Cleanup() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = windowLanguages_.begin(); it != windowLanguages_.end();) {

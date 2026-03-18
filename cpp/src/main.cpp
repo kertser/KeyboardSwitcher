@@ -229,36 +229,53 @@ static void HandleFocusChange() {
                           (ctxHash != g_lastContextHash);
 
     if (contextChanged) {
+        // When the context changes within the same HWND (tab switch,
+        // field switch), clear all OTHER saved contexts for that HWND.
+        // This ensures that a closed-and-reopened tab with the same
+        // name (e.g. "New Tab" in Chrome) starts with a clean slate.
+        if (hwnd == g_lastForegroundHwnd && g_windows) {
+            g_windows->ClearOtherContexts(hwnd, ctxHash);
+        }
+
         g_lastForegroundHwnd = hwnd;
         g_lastContextHash    = ctxHash;
 
         std::string currentLayout = GetCurrentKeyboardLayout();
+        std::string savedLang;
 
         if (g_windows && Config::SaveWindowState.load()) {
-            std::string savedLang = g_windows->GetLanguage(hwnd, ctxHash);
+            savedLang = g_windows->GetLanguage(hwnd, ctxHash);
             if (!savedLang.empty()) {
-                // Known window/tab/field — restore its language
+                // Known, confirmed context — restore its language
                 if (savedLang != currentLayout) {
                     ChangeKeyboardLayout(savedLang);
                 }
                 Config::LastSetting = savedLang;
             } else {
-                // New context — record current layout
-                g_windows->SetLanguage(hwnd, ctxHash, currentLayout);
+                // Unvisited context — do NOT record yet; let detection
+                // or a manual layout switch confirm the language first.
                 Config::LastSetting = currentLayout;
             }
         } else {
             Config::LastSetting = currentLayout;
         }
 
-        UpdateTrayTooltip();
-    }
+        g_cache.Clear();
+        g_history.Clear();
 
-    // Always clear cache and enable detection
-    // (any focus change or click = new typing session)
-    g_cache.Clear();
-    g_history.Clear();
-    Config::SEARCH.store(true);
+        // Enable detection only for unconfirmed contexts.
+        // If a language was already confirmed (by detection or manual
+        // switch), clicking / switching back does NOT restart detection.
+        Config::SEARCH.store(savedLang.empty());
+
+        UpdateTrayTooltip();
+    } else {
+        // Same context (e.g. user clicked in the same text field).
+        // Clear the cache for a fresh typing position but do NOT
+        // change SEARCH — if detection already completed, respect it.
+        g_cache.Clear();
+        g_history.Clear();
+    }
 }
 
 // ============================================================
@@ -430,29 +447,28 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // --- Track manual layout changes ---
     // If the user manually switched the layout (e.g. Alt+Shift),
-    // disable detection until the next click / focus change —
-    // the user already chose a language.
+    // update the saved language and disable detection — the user
+    // already chose a language.  Only applies when a language was
+    // previously confirmed; for unvisited contexts detection will
+    // handle whatever layout the user is on.
     {
-        std::string currentLayout = GetCurrentKeyboardLayout();
         if (g_windows && g_lastForegroundHwnd) {
             std::string windowLang =
                 g_windows->GetLanguage(g_lastForegroundHwnd, g_lastContextHash);
-            if (windowLang.empty()) {
-                // First visit to this window/tab/field — record the current layout
-                g_windows->SetLanguage(g_lastForegroundHwnd, g_lastContextHash,
-                                       currentLayout);
-                Config::LastSetting = currentLayout;
-            } else if (windowLang != currentLayout) {
-                // Layout changed since we last recorded it → manual switch
-                if (Config::SaveWindowState.load()) {
-                    g_windows->SetLanguage(g_lastForegroundHwnd, g_lastContextHash,
-                                           currentLayout);
+            if (!windowLang.empty()) {
+                std::string currentLayout = GetCurrentKeyboardLayout();
+                if (windowLang != currentLayout) {
+                    // Layout changed since last confirmed → manual switch
+                    if (Config::SaveWindowState.load()) {
+                        g_windows->SetLanguage(g_lastForegroundHwnd,
+                                               g_lastContextHash, currentLayout);
+                    }
+                    Config::LastSetting = currentLayout;
+                    g_cache.Clear();
+                    g_history.Clear();
+                    Config::SEARCH.store(false);
+                    UpdateTrayTooltip();
                 }
-                Config::LastSetting = currentLayout;
-                g_cache.Clear();
-                g_history.Clear();
-                Config::SEARCH.store(false);
-                UpdateTrayTooltip();
             }
         }
     }
@@ -558,25 +574,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     }
 
                     g_isSendingInput.store(true);
-                    // Block physical keyboard/mouse input for the duration
-                    // of the correction.  BlockInput() only blocks hardware
-                    // events — our SendInput() calls are still delivered.
                     BOOL blocked = BlockInput(TRUE);
 
-                    // Current keystroke not delivered yet; erase N-1 on screen
                     if (cacheLen > 1)
                         SendBackspaces(cacheLen - 1);
 
-                    // Change keyboard layout to the detected language
-                    // (SendMessage is synchronous — layout is active on return)
                     ChangeKeyboardLayout(bestLang);
-                    if (g_windows && g_lastForegroundHwnd) {
-                        g_windows->SetLanguage(g_lastForegroundHwnd,
-                                               g_lastContextHash, bestLang);
-                    }
-                    Config::LastSetting = bestLang;
 
-                    // Re-type the full corrected text (KEYEVENTF_UNICODE — layout-independent)
                     std::vector<wchar_t> correctedChars(correctedText.begin(), correctedText.end());
                     SendString(correctedChars);
 
@@ -586,7 +590,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     UpdateTrayTooltip();
                 }
 
-                // Clear cache and disable search until next mouse click
+                // Confirm the detected language for this context —
+                // whether or not a correction was needed.  This marks
+                // the context as "decided" so future clicks in the same
+                // window/tab/field don't restart detection.
+                if (g_windows && g_lastForegroundHwnd) {
+                    g_windows->SetLanguage(g_lastForegroundHwnd,
+                                           g_lastContextHash, bestLang);
+                }
+                Config::LastSetting = bestLang;
+
                 g_cache.Clear();
                 g_history.Clear();
                 Config::SEARCH.store(false);
