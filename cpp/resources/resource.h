@@ -8,6 +8,7 @@
 #define ID_TRAY_ABOUT            1003
 #define ID_TRAY_EXIT             1004
 #define ID_TRAY_TYPO_RESILIENCE  1005
+#define ID_TRAY_DEBUG_LOG        1006
 
 // Confidence flyout control IDs
 #define IDC_SLIDER_MIN_CONF  2001

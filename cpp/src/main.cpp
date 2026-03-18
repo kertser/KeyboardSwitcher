@@ -33,17 +33,88 @@
 // ============================================================
 // Debug log — writes to ks_debug.log next to the exe
 // ============================================================
+// Disabled by default.  Toggle from the tray context menu.
+// Entries are timestamped.  When the file exceeds MAX_LOG_BYTES
+// the oldest half is discarded (roll).
+// ============================================================
+static std::string  g_debugLogPath;
 static std::ofstream g_debugLog;
+static bool          g_debugLogEnabled = false;
+static constexpr size_t MAX_LOG_BYTES = 512 * 1024;  // 512 KB
 
 static void DbgInit() {
+    // Build the path once; the file is only opened when enabled.
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(nullptr, path, MAX_PATH);
     std::wstring dir(path);
     size_t pos = dir.find_last_of(L"\\/");
     if (pos != std::wstring::npos) dir = dir.substr(0, pos);
-    std::string logPath(dir.begin(), dir.end());
-    logPath += "\\ks_debug.log";
-    g_debugLog.open(logPath, std::ios::trunc);
+    g_debugLogPath.assign(dir.begin(), dir.end());
+    g_debugLogPath += "\\ks_debug.log";
+}
+
+static void DbgOpen() {
+    if (g_debugLog.is_open()) return;
+    // Open in append mode so we keep prior entries from this session
+    g_debugLog.open(g_debugLogPath, std::ios::app);
+}
+
+static void DbgClose() {
+    if (g_debugLog.is_open()) g_debugLog.close();
+}
+
+// Roll the log file: keep the newest half, discard the oldest.
+static void DbgRollIfNeeded() {
+    if (!g_debugLog.is_open()) return;
+    g_debugLog.flush();
+
+    // Check current file size
+    std::ifstream in(g_debugLogPath, std::ios::ate | std::ios::binary);
+    if (!in) return;
+    auto fileSize = static_cast<size_t>(in.tellg());
+    if (fileSize <= MAX_LOG_BYTES) return;
+
+    // Read entire file, keep the newest half starting at a newline
+    in.seekg(0);
+    std::string content(fileSize, '\0');
+    in.read(&content[0], fileSize);
+    in.close();
+
+    size_t cutPos = fileSize / 2;
+    // Advance to the next newline so we don't cut mid-line
+    size_t nl = content.find('\n', cutPos);
+    if (nl != std::string::npos) cutPos = nl + 1;
+
+    std::string kept = content.substr(cutPos);
+
+    // Re-open in truncate mode and write the kept portion
+    DbgClose();
+    {
+        std::ofstream out(g_debugLogPath, std::ios::trunc);
+        out << "[LOG ROLLED — older entries discarded]\n";
+        out << kept;
+    }
+    DbgOpen();
+}
+
+static void DbgSetEnabled(bool enabled) {
+    g_debugLogEnabled = enabled;
+    if (enabled) {
+        DbgOpen();
+    } else {
+        DbgClose();
+    }
+}
+
+// Get current local time as "YYYY-MM-DD HH:MM:SS"
+static std::string DbgTimestamp() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+    return buf;
 }
 
 static std::string ws2s(const std::wstring& w) {
@@ -57,14 +128,15 @@ static std::string ws2s(const std::wstring& w) {
 }
 
 static void Dbg(const char* fmt, ...) {
-    if (!g_debugLog.is_open()) return;
+    if (!g_debugLogEnabled || !g_debugLog.is_open()) return;
     va_list ap;
     va_start(ap, fmt);
     char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    g_debugLog << buf << std::endl;
+    g_debugLog << "[" << DbgTimestamp() << "] " << buf << std::endl;
     g_debugLog.flush();
+    DbgRollIfNeeded();
 }
 
 // ============================================================
@@ -191,19 +263,16 @@ static HWND GetFocusedChildHwnd(HWND topLevel) {
 // ============================================================
 // Helper: compute a context hash for window/tab/field tracking
 // ============================================================
-// Combines the normalized window title (distinguishes browser tabs)
-// with the focused child control HWND (distinguishes text fields
-// inside classic Win32 windows like Notepad++, dialogs, etc.).
-// For single-HWND apps the focused-child part is zero — the hash
-// degrades to title-only, which is the same as tab-level tracking.
+// Uses the normalized window title to distinguish tabs/documents.
+// The title is normalized (leading *, •, ●, and "(N)" stripped)
+// so cosmetic changes don't create separate tracking entries.
+//
+// Note: we intentionally do NOT mix in the focused child HWND.
+// Chrome (and other multi-process apps) change their focused
+// child between WinEvent and mouse-click calls, making the hash
+// unstable and causing saved languages to become unfindable.
 static size_t GetWindowContextHash(HWND hwnd) {
-    size_t h = GetWindowTitleHash(hwnd);
-    HWND focus = GetFocusedChildHwnd(hwnd);
-    if (focus) {
-        // Mix in the focused control's identity
-        h ^= reinterpret_cast<uintptr_t>(focus) * size_t(2654435761u);
-    }
-    return h;
+    return GetWindowTitleHash(hwnd);
 }
 
 
@@ -328,10 +397,15 @@ static void HandleFocusChange(bool forceSearch = false) {
         g_cache.Clear();
         g_history.Clear();
 
-        // Enable detection for unconfirmed contexts, or if forced by click
-        Config::SEARCH.store(forceSearch || savedLang.empty());
-        Dbg("SEARCH set to %d (force=%d savedLang=%s)",
-            Config::SEARCH.load(), forceSearch, savedLang.c_str());
+        // Always enable detection on context change (new window or tab
+        // switch).  This catches layout mistakes even when returning to
+        // a previously confirmed tab.  If the user types in the correct
+        // language, detection simply confirms silently (no visible
+        // correction).  The forceSearch flag only governs the same-
+        // context branch below (repeated clicks in the same spot).
+        Config::SEARCH.store(true);
+        Dbg("SEARCH set to 1 (contextChanged, savedLang=%s)",
+            savedLang.c_str());
 
         UpdateTrayTooltip();
     } else {
@@ -443,18 +517,32 @@ static void SendString(const std::vector<wchar_t>& chars) {
     // Delay to ensure clipboard is ready
     Sleep(10);
 
-    // Send WM_PASTE to the focused control
-    HWND hwnd = GetForegroundWindow();
-    if (hwnd) {
-        DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
-        GUITHREADINFO gti = {};
-        gti.cbSize = sizeof(gti);
-        HWND target = hwnd;
-        if (GetGUIThreadInfo(threadId, &gti) && gti.hwndFocus) {
-            target = gti.hwndFocus;
-        }
-        SendMessageW(target, WM_PASTE, 0, 0);
-    }
+    // Paste via Ctrl+V (SendInput).
+    // WM_PASTE via SendMessageW doesn't work reliably in Chrome —
+    // the HWND from GetGUIThreadInfo may not forward the message to
+    // the renderer.  Ctrl+V works universally: Chrome, WinUI
+    // (Notepad), classic Win32, Electron, etc.
+    // The injected events carry LLKHF_INJECTED so our hook passes
+    // them through without caching or detection.
+    INPUT inputs[4] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'V';
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'V';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(4, inputs, sizeof(INPUT));
+
+    // Let the target app process the Ctrl+V
+    Sleep(30);
 }
 
 // ============================================================
@@ -598,6 +686,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         if (liveCtxHash != g_lastContextHash) {
                             g_windows->SetLanguage(g_lastForegroundHwnd,
                                                    liveCtxHash, currentLayout);
+                            g_lastContextHash = liveCtxHash;
                         }
                     }
                     Config::LastSetting = currentLayout;
@@ -752,6 +841,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (liveCtxHash != g_lastContextHash) {
                         g_windows->SetLanguage(g_lastForegroundHwnd,
                                                liveCtxHash, bestLang);
+                        // Update tracking so the next keystroke doesn't
+                        // see a phantom context change from title drift
+                        g_lastContextHash = liveCtxHash;
                     }
 
                     Dbg("SAVE-LANG: lang=%s hwnd=%p ctxHash=%zu liveCtxHash=%zu",
@@ -1037,6 +1129,9 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     | (Config::EnableTypoResilience ? MF_CHECKED : MF_UNCHECKED)
                     | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
                     ID_TRAY_TYPO_RESILIENCE, L"Typo Resilience");
+                AppendMenuW(hMenu,
+                    MF_STRING | (g_debugLogEnabled ? MF_CHECKED : MF_UNCHECKED),
+                    ID_TRAY_DEBUG_LOG, L"Debug Log");
 
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"About");
@@ -1060,6 +1155,14 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_TYPO_RESILIENCE:
             Config::EnableTypoResilience = !Config::EnableTypoResilience;
+            break;
+        case ID_TRAY_DEBUG_LOG:
+            DbgSetEnabled(!g_debugLogEnabled);
+            if (g_debugLogEnabled) {
+                Dbg("=== Debug logging enabled (v%s) ===",
+                    std::string(Config::VERSION,
+                                Config::VERSION + wcslen(Config::VERSION)).c_str());
+            }
             break;
         case ID_TRAY_ABOUT:
             g_trayIcon.ShowBalloon((std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
