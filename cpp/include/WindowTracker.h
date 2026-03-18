@@ -17,10 +17,6 @@ public:
     // Set the language for a window+tab combination.
     void SetLanguage(HWND hwnd, size_t titleHash, const std::string& language);
 
-    // Clear all saved contexts for an HWND except the given one.
-    // Called on same-HWND context switches (tab/field change) so
-    // that closed-and-reopened tabs with the same name start fresh.
-    void ClearOtherContexts(HWND hwnd, size_t keepContextHash);
 
     // Remove entries for closed windows
     void Cleanup();

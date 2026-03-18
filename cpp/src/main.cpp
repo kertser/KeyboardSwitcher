@@ -229,13 +229,6 @@ static void HandleFocusChange() {
                           (ctxHash != g_lastContextHash);
 
     if (contextChanged) {
-        // When the context changes within the same HWND (tab switch,
-        // field switch), clear all OTHER saved contexts for that HWND.
-        // This ensures that a closed-and-reopened tab with the same
-        // name (e.g. "New Tab" in Chrome) starts with a clean slate.
-        if (hwnd == g_lastForegroundHwnd && g_windows) {
-            g_windows->ClearOtherContexts(hwnd, ctxHash);
-        }
 
         g_lastForegroundHwnd = hwnd;
         g_lastContextHash    = ctxHash;
