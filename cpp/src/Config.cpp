@@ -58,10 +58,10 @@ namespace Config {
 
         // ── English ↔ Hebrew ─── (slightly stricter at short lengths)
         { {"en", "he"}, { 3, 10, 0.98f, 0.60f, 2, 0.85f } },
-        { {"he", "en"}, { 3, 10, 0.98f, 0.60f, 2, 0.85f } },
+        { {"he", "en"}, { 4, 10, 0.98f, 0.60f, 2, 0.85f } },
 
         // ── Russian ↔ Hebrew ─── (both non-Latin; need more context)
-        { {"ru", "he"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
+        { {"ru", "he"}, { 3, 10, 0.98f, 0.60f, 2, 0.80f } },
         { {"he", "ru"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
     };
 

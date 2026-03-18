@@ -17,7 +17,7 @@
 #include <vector>
 #include <set>
 #include <algorithm>
-#include <thread>
+#include <functional>
 #include <atomic>
 
 #include "Config.h"
@@ -40,6 +40,12 @@ static WindowTracker*      g_windows = nullptr;
 static LanguageDetector*   g_detector = nullptr;
 static TrayIcon            g_trayIcon;
 static std::atomic<bool>   g_isSendingInput{false}; // re-entrancy guard
+
+// Focus tracking — updated by HandleFocusChange(), read by hooks.
+// All accesses are on the main (message-loop) thread — no mutex needed.
+static HWND          g_lastForegroundHwnd = nullptr;
+static size_t        g_lastTitleHash      = 0;
+static HWINEVENTHOOK g_winEventHook       = nullptr;
 
 // ============================================================
 // Helper: get the executable directory
@@ -83,6 +89,47 @@ static void UpdateTrayTooltip() {
 }
 
 // ============================================================
+// Helper: compute title hash for tab-aware window tracking
+// ============================================================
+// For other-process windows GetWindowTextW reads the cached
+// internal copy without sending WM_GETTEXT — fast & safe from hooks.
+//
+// The title is *normalized* before hashing so that cosmetic
+// changes (Notepad++ prepending "*" for unsaved, browsers
+// showing "(3)" unread-count badges, etc.) do NOT create a
+// separate tracking entry.
+static size_t GetWindowTitleHash(HWND hwnd) {
+    wchar_t buf[256] = {};
+    GetWindowTextW(hwnd, buf, 256);
+    std::wstring t(buf);
+
+    // Strip leading modification indicators: *, •, ●  and spaces
+    size_t start = 0;
+    while (start < t.size() &&
+           (t[start] == L'*' || t[start] == L'\u2022' /*•*/  ||
+            t[start] == L'\u25CF' /*●*/ || t[start] == L' '))
+        ++start;
+
+    // Strip leading notification count: "(N) "
+    if (start < t.size() && t[start] == L'(') {
+        size_t close = t.find(L')', start);
+        if (close != std::wstring::npos && close - start <= 5) {
+            bool allDigits = true;
+            for (size_t i = start + 1; i < close; ++i) {
+                if (!iswdigit(t[i])) { allDigits = false; break; }
+            }
+            if (allDigits) {
+                start = close + 1;
+                while (start < t.size() && t[start] == L' ') ++start;
+            }
+        }
+    }
+
+    return std::hash<std::wstring>{}(t.substr(start));
+}
+
+
+// ============================================================
 // Helper: find the actual installed HKL for a language
 // ============================================================
 static HKL FindInstalledHKL(const std::string& lang) {
@@ -120,6 +167,78 @@ static void ChangeKeyboardLayout(const std::string& lang) {
     // have changed by the time this function returns.
     SendMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
 }
+
+// ============================================================
+// Centralized focus-change handler
+// ============================================================
+// Called when the foreground window or its title (tab) changes,
+// or when the user clicks (new typing session).  All callers
+// are on the main (message-loop) thread — no locking needed for
+// the g_last* globals.
+static void HandleFocusChange() {
+    if (g_isSendingInput.load()) return;
+
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return;
+
+    // Skip focus changes to our own windows (tray menu, flyout panel)
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return;
+
+    size_t titleHash = GetWindowTitleHash(hwnd);
+    bool contextChanged = (hwnd != g_lastForegroundHwnd) ||
+                          (titleHash != g_lastTitleHash);
+
+    if (contextChanged) {
+        g_lastForegroundHwnd = hwnd;
+        g_lastTitleHash      = titleHash;
+
+        std::string currentLayout = GetCurrentKeyboardLayout();
+
+        if (g_windows && Config::SaveWindowState.load()) {
+            std::string savedLang = g_windows->GetLanguage(hwnd, titleHash);
+            if (!savedLang.empty()) {
+                // Known window/tab — restore its language
+                if (savedLang != currentLayout) {
+                    ChangeKeyboardLayout(savedLang);
+                }
+                Config::LastSetting = savedLang;
+            } else {
+                // New window/tab — record current layout
+                g_windows->SetLanguage(hwnd, titleHash, currentLayout);
+                Config::LastSetting = currentLayout;
+            }
+        } else {
+            Config::LastSetting = currentLayout;
+        }
+
+        UpdateTrayTooltip();
+    }
+
+    // Always clear cache and enable detection
+    // (any focus change or click = new typing session)
+    g_cache.Clear();
+    g_history.Clear();
+    Config::SEARCH.store(true);
+}
+
+// ============================================================
+// WinEvent callback — fired by the OS on foreground changes
+// ============================================================
+// Installed with WINEVENT_OUTOFCONTEXT so the callback is
+// delivered on the message-loop thread via the message pump.
+static void CALLBACK WinEventProc(
+    HWINEVENTHOOK /*hWinEventHook*/, DWORD event,
+    HWND /*hwnd*/, LONG /*idObject*/, LONG /*idChild*/,
+    DWORD /*dwEventThread*/, DWORD /*dwmsEventTime*/)
+{
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        if (!Config::EnableSwitcher.load()) return;
+        HandleFocusChange();
+    }
+}
+
 
 // ============================================================
 // Helper: send N backspaces via SendInput
@@ -243,69 +362,60 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     DWORD vk = pKb->vkCode;
 
-    // --- Alt+Tab detection ---
-    if (vk == VK_LMENU || vk == VK_RMENU) {
-        Config::alt_pressed.store(true);
-        return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
-    }
-    if (Config::alt_pressed.load() && vk == VK_TAB) {
-        Config::alt_pressed.store(false);
-        // After Alt+Tab, schedule a re-check via a short delay
-        std::thread([]() {
-            Sleep(500);
-            std::string currentLayout = GetCurrentKeyboardLayout();
-            std::string windowLang;
-            if (g_windows) {
-                windowLang = g_windows->GetActiveWindowLanguage();
-                if (Config::SaveWindowState.load()) {
-                    if (windowLang.empty()) {
-                        g_windows->SetActiveWindowLanguage(currentLayout);
-                        Config::LastSetting = currentLayout;
-                    } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
-                        g_windows->SetActiveWindowLanguage(currentLayout);
-                        Config::LastSetting = currentLayout;
-                    } else {
-                        ChangeKeyboardLayout(windowLang);
-                        Config::LastSetting = windowLang;
-                    }
-                }
+    // --- Focus-change detection (belt-and-suspenders) ---
+    // EVENT_SYSTEM_FOREGROUND handles most focus changes, but we
+    // also check here to catch edge cases where the WinEvent
+    // callback hasn't been dispatched yet, and to detect in-window
+    // tab switches (title changes, e.g. Ctrl+Tab in a browser).
+    //
+    // Title-hash is only checked when the cache is empty (start of
+    // a new typing session).  This avoids spurious resets when apps
+    // like Notepad++ update the title mid-typing (e.g. prepending
+    // "*" for unsaved changes).
+    {
+        HWND currentHwnd = GetForegroundWindow();
+        if (currentHwnd) {
+            bool hwndChanged  = (currentHwnd != g_lastForegroundHwnd);
+            bool titleChanged = false;
+            if (!hwndChanged && g_cache.Size() == 0) {
+                // Same HWND, no chars yet — check for tab switch.
+                // GetWindowTextW on another process's window reads the
+                // OS-cached caption — no cross-process SendMessage.
+                size_t titleHash = GetWindowTitleHash(currentHwnd);
+                titleChanged = (titleHash != g_lastTitleHash);
             }
-            g_cache.Clear();
-            g_history.Clear();
-            // When SaveWindowState is on and the window already has a
-            // known language, skip re-detection — the language was already
-            // decided.  Otherwise start a fresh detection frame.
-            if (!Config::SaveWindowState.load() || windowLang.empty()) {
-                Config::SEARCH.store(true);
+            if (hwndChanged || titleChanged) {
+                HandleFocusChange();
             }
-            UpdateTrayTooltip();
-        }).detach();
-        return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
-    }
-    if (vk != VK_LMENU && vk != VK_RMENU) {
-        Config::alt_pressed.store(false);
+        }
     }
 
     // --- Track manual layout changes ---
-    // If the user manually switched the layout (e.g. Alt+Shift), disable
-    // detection until the next mouse click – the user already chose a language.
-    std::string currentLayout = GetCurrentKeyboardLayout();
-    if (g_windows) {
-        std::string windowLang = g_windows->GetActiveWindowLanguage();
-        if (windowLang.empty()) {
-            // First visit to this window — just record the current layout
-            g_windows->SetActiveWindowLanguage(currentLayout);
-            Config::LastSetting = currentLayout;
-        } else if (windowLang != currentLayout) {
-            if (Config::SaveWindowState.load()) {
-                g_windows->SetActiveWindowLanguage(currentLayout);
+    // If the user manually switched the layout (e.g. Alt+Shift),
+    // disable detection until the next click / focus change —
+    // the user already chose a language.
+    {
+        std::string currentLayout = GetCurrentKeyboardLayout();
+        if (g_windows && g_lastForegroundHwnd) {
+            std::string windowLang =
+                g_windows->GetLanguage(g_lastForegroundHwnd, g_lastTitleHash);
+            if (windowLang.empty()) {
+                // First visit to this window/tab — record the current layout
+                g_windows->SetLanguage(g_lastForegroundHwnd, g_lastTitleHash,
+                                       currentLayout);
                 Config::LastSetting = currentLayout;
+            } else if (windowLang != currentLayout) {
+                // Layout changed since we last recorded it → manual switch
+                if (Config::SaveWindowState.load()) {
+                    g_windows->SetLanguage(g_lastForegroundHwnd, g_lastTitleHash,
+                                           currentLayout);
+                }
+                Config::LastSetting = currentLayout;
+                g_cache.Clear();
+                g_history.Clear();
+                Config::SEARCH.store(false);
+                UpdateTrayTooltip();
             }
-            // Manual switch detected → stop auto-detection until next click
-            g_cache.Clear();
-            g_history.Clear();
-            Config::SEARCH.store(false);
-            UpdateTrayTooltip();
         }
     }
 
@@ -422,8 +532,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     // Change keyboard layout to the detected language
                     // (SendMessage is synchronous — layout is active on return)
                     ChangeKeyboardLayout(bestLang);
-                    if (g_windows) {
-                        g_windows->SetActiveWindowLanguage(bestLang);
+                    if (g_windows && g_lastForegroundHwnd) {
+                        g_windows->SetLanguage(g_lastForegroundHwnd,
+                                               g_lastTitleHash, bestLang);
                     }
                     Config::LastSetting = bestLang;
 
@@ -462,34 +573,10 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 
     if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) {
-        g_cache.Clear();
-        g_history.Clear();
-
-        std::string currentLayout = GetCurrentKeyboardLayout();
-        std::string windowLang;
-        if (g_windows) {
-            windowLang = g_windows->GetActiveWindowLanguage();
-            if (Config::SaveWindowState.load()) {
-                if (windowLang.empty()) {
-                    g_windows->SetActiveWindowLanguage(currentLayout);
-                    Config::LastSetting = currentLayout;
-                } else if (windowLang != currentLayout && currentLayout != Config::LastSetting) {
-                    g_windows->SetActiveWindowLanguage(currentLayout);
-                    Config::LastSetting = currentLayout;
-                } else {
-                    ChangeKeyboardLayout(windowLang);
-                    Config::LastSetting = windowLang;
-                }
-            }
-        }
-
-        // When SaveWindowState is on and the window already has a
-        // known language, skip re-detection — the language was already
-        // decided.  Otherwise start a fresh detection frame.
-        if (!Config::SaveWindowState.load() || windowLang.empty()) {
-            Config::SEARCH.store(true);
-        }
-        UpdateTrayTooltip();
+        // Click anywhere = new typing session.
+        // HandleFocusChange checks for window/tab change, restores
+        // saved language if needed, clears cache, and enables SEARCH.
+        HandleFocusChange();
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -827,6 +914,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     std::string initialLang = GetCurrentKeyboardLayout();
     Config::LastSetting = initialLang;
 
+    // Seed focus-tracking globals so the first keystroke doesn't
+    // trigger a spurious HandleFocusChange.
+    g_lastForegroundHwnd = GetForegroundWindow();
+    g_lastTitleHash = g_lastForegroundHwnd
+                        ? GetWindowTitleHash(g_lastForegroundHwnd)
+                        : 0;
+
     // Register hidden window class
     const wchar_t CLASS_NAME[] = L"KeyboardSwitcherHiddenWindow";
     WNDCLASSEXW wc = {};
@@ -867,6 +961,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
+    // Install WinEvent hook for foreground-window changes.
+    // Covers Alt+Tab, Win+Tab, taskbar clicks, Alt+F4 exposing the
+    // next window, virtual-desktop switches, etc.
+    // WINEVENT_OUTOFCONTEXT → callback is delivered via the message pump
+    //                         on this thread — no cross-thread issues.
+    // WINEVENT_SKIPOWNPROCESS → ignore focus changes to our own windows
+    //                           (tray menu, confidence flyout).
+    g_winEventHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        nullptr, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
     // Message loop (required for low-level hooks to work)
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -875,6 +981,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     // Cleanup
+    if (g_winEventHook) UnhookWinEvent(g_winEventHook);
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_mouseHook)    UnhookWindowsHookEx(g_mouseHook);
     g_detector = nullptr;

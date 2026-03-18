@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.5
+# Keyboard Switcher v1.2.6
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 

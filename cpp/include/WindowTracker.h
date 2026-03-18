@@ -9,17 +9,19 @@ class WindowTracker {
 public:
     WindowTracker() = default;
 
-    // Get the language for the currently active window.
-    // Returns "" if the window has not been visited yet.
-    std::string GetActiveWindowLanguage();
+    // Get the saved language for a window+tab combination.
+    // titleHash distinguishes tabs within the same HWND (e.g., browser tabs).
+    // Returns "" if the window/tab has not been visited yet.
+    std::string GetLanguage(HWND hwnd, size_t titleHash) const;
 
-    // Set the language for the currently active window
-    void SetActiveWindowLanguage(const std::string& language);
+    // Set the language for a window+tab combination.
+    void SetLanguage(HWND hwnd, size_t titleHash, const std::string& language);
 
     // Remove entries for closed windows
     void Cleanup();
 
 private:
     mutable std::mutex mutex_;
-    std::unordered_map<HWND, std::string> windowLanguages_;
+    // Outer map: HWND → (inner map: titleHash → language)
+    std::unordered_map<HWND, std::unordered_map<size_t, std::string>> windowLanguages_;
 };
