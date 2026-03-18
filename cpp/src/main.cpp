@@ -44,7 +44,7 @@ static std::atomic<bool>   g_isSendingInput{false}; // re-entrancy guard
 // Focus tracking — updated by HandleFocusChange(), read by hooks.
 // All accesses are on the main (message-loop) thread — no mutex needed.
 static HWND          g_lastForegroundHwnd = nullptr;
-static size_t        g_lastTitleHash      = 0;
+static size_t        g_lastContextHash    = 0;
 static HWINEVENTHOOK g_winEventHook       = nullptr;
 
 // ============================================================
@@ -128,6 +128,44 @@ static size_t GetWindowTitleHash(HWND hwnd) {
     return std::hash<std::wstring>{}(t.substr(start));
 }
 
+// ============================================================
+// Helper: get the focused child control inside a top-level window
+// ============================================================
+// Uses GetGUIThreadInfo() which reads kernel state — no IPC,
+// safe and fast to call from low-level hooks.
+// Returns nullptr when the focus is on the top-level window itself
+// or when the info cannot be obtained (modern single-HWND frameworks
+// like WPF, Electron, UWP — graceful degradation).
+static HWND GetFocusedChildHwnd(HWND topLevel) {
+    if (!topLevel) return nullptr;
+    DWORD threadId = GetWindowThreadProcessId(topLevel, nullptr);
+    GUITHREADINFO gti = {};
+    gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(threadId, &gti) &&
+        gti.hwndFocus && gti.hwndFocus != topLevel) {
+        return gti.hwndFocus;
+    }
+    return nullptr;
+}
+
+// ============================================================
+// Helper: compute a context hash for window/tab/field tracking
+// ============================================================
+// Combines the normalized window title (distinguishes browser tabs)
+// with the focused child control HWND (distinguishes text fields
+// inside classic Win32 windows like Notepad++, dialogs, etc.).
+// For single-HWND apps the focused-child part is zero — the hash
+// degrades to title-only, which is the same as tab-level tracking.
+static size_t GetWindowContextHash(HWND hwnd) {
+    size_t h = GetWindowTitleHash(hwnd);
+    HWND focus = GetFocusedChildHwnd(hwnd);
+    if (focus) {
+        // Mix in the focused control's identity
+        h ^= reinterpret_cast<uintptr_t>(focus) * size_t(2654435761u);
+    }
+    return h;
+}
+
 
 // ============================================================
 // Helper: find the actual installed HKL for a language
@@ -186,27 +224,27 @@ static void HandleFocusChange() {
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) return;
 
-    size_t titleHash = GetWindowTitleHash(hwnd);
+    size_t ctxHash = GetWindowContextHash(hwnd);
     bool contextChanged = (hwnd != g_lastForegroundHwnd) ||
-                          (titleHash != g_lastTitleHash);
+                          (ctxHash != g_lastContextHash);
 
     if (contextChanged) {
         g_lastForegroundHwnd = hwnd;
-        g_lastTitleHash      = titleHash;
+        g_lastContextHash    = ctxHash;
 
         std::string currentLayout = GetCurrentKeyboardLayout();
 
         if (g_windows && Config::SaveWindowState.load()) {
-            std::string savedLang = g_windows->GetLanguage(hwnd, titleHash);
+            std::string savedLang = g_windows->GetLanguage(hwnd, ctxHash);
             if (!savedLang.empty()) {
-                // Known window/tab — restore its language
+                // Known window/tab/field — restore its language
                 if (savedLang != currentLayout) {
                     ChangeKeyboardLayout(savedLang);
                 }
                 Config::LastSetting = savedLang;
             } else {
-                // New window/tab — record current layout
-                g_windows->SetLanguage(hwnd, titleHash, currentLayout);
+                // New context — record current layout
+                g_windows->SetLanguage(hwnd, ctxHash, currentLayout);
                 Config::LastSetting = currentLayout;
             }
         } else {
@@ -366,25 +404,25 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // EVENT_SYSTEM_FOREGROUND handles most focus changes, but we
     // also check here to catch edge cases where the WinEvent
     // callback hasn't been dispatched yet, and to detect in-window
-    // tab switches (title changes, e.g. Ctrl+Tab in a browser).
+    // tab switches (title changes) and focus-control changes
+    // (Tab between text fields in classic Win32 windows).
     //
-    // Title-hash is only checked when the cache is empty (start of
+    // Context hash is only checked when the cache is empty (start of
     // a new typing session).  This avoids spurious resets when apps
     // like Notepad++ update the title mid-typing (e.g. prepending
     // "*" for unsaved changes).
     {
         HWND currentHwnd = GetForegroundWindow();
         if (currentHwnd) {
-            bool hwndChanged  = (currentHwnd != g_lastForegroundHwnd);
-            bool titleChanged = false;
+            bool hwndChanged   = (currentHwnd != g_lastForegroundHwnd);
+            bool contextChanged = false;
             if (!hwndChanged && g_cache.Size() == 0) {
-                // Same HWND, no chars yet — check for tab switch.
-                // GetWindowTextW on another process's window reads the
-                // OS-cached caption — no cross-process SendMessage.
-                size_t titleHash = GetWindowTitleHash(currentHwnd);
-                titleChanged = (titleHash != g_lastTitleHash);
+                // Same HWND, no chars yet — check for tab switch
+                // or focused-control change (Tab between fields).
+                size_t ctxHash = GetWindowContextHash(currentHwnd);
+                contextChanged = (ctxHash != g_lastContextHash);
             }
-            if (hwndChanged || titleChanged) {
+            if (hwndChanged || contextChanged) {
                 HandleFocusChange();
             }
         }
@@ -398,16 +436,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         std::string currentLayout = GetCurrentKeyboardLayout();
         if (g_windows && g_lastForegroundHwnd) {
             std::string windowLang =
-                g_windows->GetLanguage(g_lastForegroundHwnd, g_lastTitleHash);
+                g_windows->GetLanguage(g_lastForegroundHwnd, g_lastContextHash);
             if (windowLang.empty()) {
-                // First visit to this window/tab — record the current layout
-                g_windows->SetLanguage(g_lastForegroundHwnd, g_lastTitleHash,
+                // First visit to this window/tab/field — record the current layout
+                g_windows->SetLanguage(g_lastForegroundHwnd, g_lastContextHash,
                                        currentLayout);
                 Config::LastSetting = currentLayout;
             } else if (windowLang != currentLayout) {
                 // Layout changed since we last recorded it → manual switch
                 if (Config::SaveWindowState.load()) {
-                    g_windows->SetLanguage(g_lastForegroundHwnd, g_lastTitleHash,
+                    g_windows->SetLanguage(g_lastForegroundHwnd, g_lastContextHash,
                                            currentLayout);
                 }
                 Config::LastSetting = currentLayout;
@@ -534,7 +572,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     ChangeKeyboardLayout(bestLang);
                     if (g_windows && g_lastForegroundHwnd) {
                         g_windows->SetLanguage(g_lastForegroundHwnd,
-                                               g_lastTitleHash, bestLang);
+                                               g_lastContextHash, bestLang);
                     }
                     Config::LastSetting = bestLang;
 
@@ -917,8 +955,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Seed focus-tracking globals so the first keystroke doesn't
     // trigger a spurious HandleFocusChange.
     g_lastForegroundHwnd = GetForegroundWindow();
-    g_lastTitleHash = g_lastForegroundHwnd
-                        ? GetWindowTitleHash(g_lastForegroundHwnd)
+    g_lastContextHash = g_lastForegroundHwnd
+                        ? GetWindowContextHash(g_lastForegroundHwnd)
                         : 0;
 
     // Register hidden window class
