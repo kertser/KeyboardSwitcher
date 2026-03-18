@@ -19,6 +19,9 @@
 #include <algorithm>
 #include <functional>
 #include <atomic>
+#include <fstream>
+#include <sstream>
+#include <cstdarg>
 
 #include "Config.h"
 #include "Languages.h"
@@ -26,6 +29,43 @@
 #include "WindowTracker.h"
 #include "TrayIcon.h"
 #include "../resources/resource.h"
+
+// ============================================================
+// Debug log — writes to ks_debug.log next to the exe
+// ============================================================
+static std::ofstream g_debugLog;
+
+static void DbgInit() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring dir(path);
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) dir = dir.substr(0, pos);
+    std::string logPath(dir.begin(), dir.end());
+    logPath += "\\ks_debug.log";
+    g_debugLog.open(logPath, std::ios::trunc);
+}
+
+static std::string ws2s(const std::wstring& w) {
+    // Simple lossy conversion for logging
+    std::string s;
+    for (wchar_t c : w) {
+        if (c < 128) s += (char)c;
+        else { s += "[U+"; char buf[8]; sprintf(buf, "%04X", (unsigned)c); s += buf; s += "]"; }
+    }
+    return s;
+}
+
+static void Dbg(const char* fmt, ...) {
+    if (!g_debugLog.is_open()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_debugLog << buf << std::endl;
+    g_debugLog.flush();
+}
 
 // ============================================================
 // Globals
@@ -213,7 +253,11 @@ static void ChangeKeyboardLayout(const std::string& lang) {
 // or when the user clicks (new typing session).  All callers
 // are on the main (message-loop) thread — no locking needed for
 // the g_last* globals.
-static void HandleFocusChange() {
+//
+// forceSearch: when true (mouse click), start fresh detection even
+//              in a confirmed context — user may want to type in a
+//              different language now.
+static void HandleFocusChange(bool forceSearch = false) {
     if (g_isSendingInput.load()) return;
 
     HWND hwnd = GetForegroundWindow();
@@ -225,10 +269,24 @@ static void HandleFocusChange() {
     if (pid == GetCurrentProcessId()) return;
 
     size_t ctxHash = GetWindowContextHash(hwnd);
-    bool contextChanged = (hwnd != g_lastForegroundHwnd) ||
-                          (ctxHash != g_lastContextHash);
+    bool sameHwnd = (hwnd == g_lastForegroundHwnd);
+    bool titleOnlyChanged = sameHwnd && (ctxHash != g_lastContextHash);
+
+    // Title-only changes while typing (cache non-empty) are cosmetic
+    // (e.g. Notepad updating title bar with content). Ignore them.
+    // Title-only changes with empty cache may be real tab switches.
+    bool allowTitleChange = (g_cache.Size() == 0);
+    bool contextChanged = !sameHwnd || (titleOnlyChanged && allowTitleChange);
+
+    Dbg("HandleFocusChange: hwnd=%p last=%p ctxHash=%zu lastCtx=%zu "
+        "sameHwnd=%d titleOnly=%d allowTitle=%d changed=%d force=%d cache=%zu",
+        hwnd, g_lastForegroundHwnd, ctxHash, g_lastContextHash,
+        sameHwnd, titleOnlyChanged, allowTitleChange, contextChanged,
+        forceSearch, g_cache.Size());
 
     if (contextChanged) {
+        size_t prevCtxHash = g_lastContextHash;
+        HWND prevHwnd = g_lastForegroundHwnd;
 
         g_lastForegroundHwnd = hwnd;
         g_lastContextHash    = ctxHash;
@@ -238,10 +296,24 @@ static void HandleFocusChange() {
 
         if (g_windows && Config::SaveWindowState.load()) {
             savedLang = g_windows->GetLanguage(hwnd, ctxHash);
+
+            // If not found under new hash but same HWND, try old hash
+            // and migrate (handles Notepad title drift)
+            if (savedLang.empty() && sameHwnd && prevHwnd == hwnd) {
+                savedLang = g_windows->GetLanguage(hwnd, prevCtxHash);
+                if (!savedLang.empty()) {
+                    g_windows->SetLanguage(hwnd, ctxHash, savedLang);
+                    Dbg("MIGRATE-LANG: %s from hash %zu to %zu",
+                        savedLang.c_str(), prevCtxHash, ctxHash);
+                }
+            }
+
             if (!savedLang.empty()) {
                 // Known, confirmed context — restore its language
                 if (savedLang != currentLayout) {
                     ChangeKeyboardLayout(savedLang);
+                    Dbg("RESTORE-LANG: %s for hwnd=%p ctxHash=%zu",
+                        savedLang.c_str(), hwnd, ctxHash);
                 }
                 Config::LastSetting = savedLang;
             } else {
@@ -256,18 +328,36 @@ static void HandleFocusChange() {
         g_cache.Clear();
         g_history.Clear();
 
-        // Enable detection only for unconfirmed contexts.
-        // If a language was already confirmed (by detection or manual
-        // switch), clicking / switching back does NOT restart detection.
-        Config::SEARCH.store(savedLang.empty());
+        // Enable detection for unconfirmed contexts, or if forced by click
+        Config::SEARCH.store(forceSearch || savedLang.empty());
+        Dbg("SEARCH set to %d (force=%d savedLang=%s)",
+            Config::SEARCH.load(), forceSearch, savedLang.c_str());
 
         UpdateTrayTooltip();
     } else {
-        // Same context (e.g. user clicked in the same text field).
-        // Clear the cache for a fresh typing position but do NOT
-        // change SEARCH — if detection already completed, respect it.
-        g_cache.Clear();
-        g_history.Clear();
+        // Same context, title may have changed but we're ignoring it.
+        // On forced search (click), allow fresh detection.
+        // Otherwise just clear cache for new typing position.
+
+        std::string savedLang;
+        if (g_windows && Config::SaveWindowState.load()) {
+            savedLang = g_windows->GetLanguage(hwnd, g_lastContextHash);
+        }
+
+        if (forceSearch) {
+            // User clicked — start fresh detection session
+            g_cache.Clear();
+            g_history.Clear();
+            Config::SEARCH.store(true);
+            Dbg("FORCE-SEARCH: click in same context, SEARCH=1");
+        } else {
+            // Just position change (e.g. arrow keys), keep state
+            // but clear cache for new typing segment
+            if (g_cache.Size() == 0) {
+                // Only clear history if no active typing
+                g_history.Clear();
+            }
+        }
     }
 }
 
@@ -292,36 +382,79 @@ static void CALLBACK WinEventProc(
 // Helper: send N backspaces via SendInput
 // ============================================================
 static void SendBackspaces(size_t count) {
-    // Batch all backspace key-down/key-up pairs into a single SendInput call
-    // to minimise the time window where real keystrokes could slip through.
-    std::vector<INPUT> inputs(count * 2);
     for (size_t i = 0; i < count; ++i) {
-        inputs[i * 2].type = INPUT_KEYBOARD;
-        inputs[i * 2].ki.wVk = VK_BACK;
-        inputs[i * 2].ki.dwFlags = 0;
-        inputs[i * 2 + 1].type = INPUT_KEYBOARD;
-        inputs[i * 2 + 1].ki.wVk = VK_BACK;
-        inputs[i * 2 + 1].ki.dwFlags = KEYEVENTF_KEYUP;
+        INPUT input = {};  // Zero-initialize every field
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_BACK;
+        SendInput(1, &input, sizeof(INPUT));
+
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &input, sizeof(INPUT));
     }
-    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    // Let app process backspaces before we send new text
+    Sleep(20);
 }
 
 // ============================================================
-// Helper: send a string via SendInput (Unicode chars)
+// Helper: send a string via clipboard paste
 // ============================================================
 static void SendString(const std::vector<wchar_t>& chars) {
-    // Batch all Unicode key-down/key-up pairs into a single SendInput call
-    // to minimise the time window where real keystrokes could collide.
-    std::vector<INPUT> inputs(chars.size() * 2);
-    for (size_t i = 0; i < chars.size(); ++i) {
-        inputs[i * 2].type = INPUT_KEYBOARD;
-        inputs[i * 2].ki.wScan = chars[i];
-        inputs[i * 2].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[i * 2 + 1].type = INPUT_KEYBOARD;
-        inputs[i * 2 + 1].ki.wScan = chars[i];
-        inputs[i * 2 + 1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    if (chars.empty()) return;
+
+    // Open clipboard with retries
+    int retries = 10;
+    while (!OpenClipboard(nullptr) && retries-- > 0) {
+        Sleep(10);
     }
-    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    if (retries <= 0) {
+        Dbg("SendString: failed to open clipboard");
+        return;
+    }
+
+    EmptyClipboard();
+
+    // Allocate and copy text to clipboard
+    size_t size = (chars.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!hMem) {
+        CloseClipboard();
+        return;
+    }
+
+    wchar_t* pMem = static_cast<wchar_t*>(GlobalLock(hMem));
+    if (!pMem) {
+        GlobalFree(hMem);
+        CloseClipboard();
+        return;
+    }
+
+    memcpy(pMem, chars.data(), chars.size() * sizeof(wchar_t));
+    pMem[chars.size()] = L'\0';
+    GlobalUnlock(hMem);
+
+    if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+        GlobalFree(hMem);
+        CloseClipboard();
+        return;
+    }
+
+    CloseClipboard();
+
+    // Delay to ensure clipboard is ready
+    Sleep(10);
+
+    // Send WM_PASTE to the focused control
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd) {
+        DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
+        GUITHREADINFO gti = {};
+        gti.cbSize = sizeof(gti);
+        HWND target = hwnd;
+        if (GetGUIThreadInfo(threadId, &gti) && gti.hwndFocus) {
+            target = gti.hwndFocus;
+        }
+        SendMessageW(target, WM_PASTE, 0, 0);
+    }
 }
 
 // ============================================================
@@ -452,9 +585,20 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 std::string currentLayout = GetCurrentKeyboardLayout();
                 if (windowLang != currentLayout) {
                     // Layout changed since last confirmed → manual switch
+                    Dbg("MANUAL-SWITCH: %s → %s for hwnd=%p ctxHash=%zu",
+                        windowLang.c_str(), currentLayout.c_str(),
+                        g_lastForegroundHwnd, g_lastContextHash);
+
                     if (Config::SaveWindowState.load()) {
                         g_windows->SetLanguage(g_lastForegroundHwnd,
                                                g_lastContextHash, currentLayout);
+
+                        // Also save under live hash if different
+                        size_t liveCtxHash = GetWindowContextHash(g_lastForegroundHwnd);
+                        if (liveCtxHash != g_lastContextHash) {
+                            g_windows->SetLanguage(g_lastForegroundHwnd,
+                                                   liveCtxHash, currentLayout);
+                        }
                     }
                     Config::LastSetting = currentLayout;
                     g_cache.Clear();
@@ -547,6 +691,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 const std::string& bestLang = detection->language;
                 bool didCorrection = false;
 
+                Dbg("DETECTION: currentLang=%s bestLang=%s conf=%.3f cacheText=%s",
+                    currentLangId.c_str(), bestLang.c_str(), detection->confidence,
+                    ws2s(text).c_str());
+
                 if (currentLangId != bestLang) {
                     size_t cacheLen = g_cache.Size();
                     auto cacheChars = g_cache.GetCache();
@@ -559,6 +707,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         Layouts::GetLayoutForLanguage(bestLang)
                     );
 
+                    Dbg("CORRECT: cacheLen=%zu cached=%s corrected=%s",
+                        cacheLen, ws2s(cachedText).c_str(), ws2s(correctedText).c_str());
+
                     // Preserve first-letter capitalization
                     if (g_cache.WasFirstCharShifted() && !correctedText.empty()) {
                         wchar_t buf[2] = { correctedText[0], L'\0' };
@@ -568,6 +719,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                     g_isSendingInput.store(true);
                     BOOL blocked = BlockInput(TRUE);
+
+                    Dbg("SENDING: backspaces=%zu text=%s",
+                        cacheLen > 1 ? cacheLen - 1 : 0, ws2s(correctedText).c_str());
 
                     if (cacheLen > 1)
                         SendBackspaces(cacheLen - 1);
@@ -588,8 +742,21 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 // the context as "decided" so future clicks in the same
                 // window/tab/field don't restart detection.
                 if (g_windows && g_lastForegroundHwnd) {
+                    // Save under stable context hash
                     g_windows->SetLanguage(g_lastForegroundHwnd,
                                            g_lastContextHash, bestLang);
+
+                    // Also save under current live hash if different
+                    // (handles Notepad title drift during correction)
+                    size_t liveCtxHash = GetWindowContextHash(g_lastForegroundHwnd);
+                    if (liveCtxHash != g_lastContextHash) {
+                        g_windows->SetLanguage(g_lastForegroundHwnd,
+                                               liveCtxHash, bestLang);
+                    }
+
+                    Dbg("SAVE-LANG: lang=%s hwnd=%p ctxHash=%zu liveCtxHash=%zu",
+                        bestLang.c_str(), g_lastForegroundHwnd,
+                        g_lastContextHash, liveCtxHash);
                 }
                 Config::LastSetting = bestLang;
 
@@ -620,7 +787,8 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         // Click anywhere = new typing session.
         // HandleFocusChange checks for window/tab change, restores
         // saved language if needed, clears cache, and enables SEARCH.
-        HandleFocusChange();
+        // forceSearch=true because user clicked — allow fresh detection.
+        HandleFocusChange(true);
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -923,6 +1091,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // WinMain - application entry point
 // ============================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // ---- Initialize debug log ----
+    DbgInit();
+    Dbg("=== KeyboardSwitcher started ===");
+
     // ---- Common controls (trackbar for confidence sliders) ----
     INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES };
     InitCommonControlsEx(&icex);
