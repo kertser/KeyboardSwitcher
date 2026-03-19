@@ -144,12 +144,20 @@ static void Dbg(const char* fmt, ...) {
 }
 
 // ============================================================
-// Update checker — queries GitHub for the latest release
+// Update checker — queries GitHub for the latest release,
+//                  downloads the installer, and runs it.
 // ============================================================
-#define WM_UPDATE_CHECK_RESULT (WM_APP + 2)
+#define WM_UPDATE_CHECK_RESULT  (WM_APP + 2)
+#define WM_UPDATE_DOWNLOAD_DONE (WM_APP + 3)
 
-static std::string g_latestVersionResult;   // written by bg thread, read by UI thread
-static bool        g_updateCheckManual = false;  // true when user clicked "Check for Updates"
+// Result of the version check (set by bg thread, read by UI thread)
+struct UpdateInfo {
+    std::string version;      // latest version string (e.g. "1.3.0")
+    std::string downloadUrl;  // browser_download_url for the .exe asset
+};
+static UpdateInfo  g_updateInfo;
+static bool        g_updateCheckManual = false;
+static std::wstring g_downloadedInstallerPath;  // path to the downloaded file
 
 // Compare semver strings "X.Y.Z". Returns >0 if a > b, 0 if equal, <0 if a < b.
 static int CompareVersions(const std::string& a, const std::string& b) {
@@ -161,29 +169,42 @@ static int CompareVersions(const std::string& a, const std::string& b) {
     return a3 - b3;
 }
 
-// Fetch the latest release version tag from GitHub (blocking network call).
-// Returns the version string (without leading 'v') or "" on failure.
-static std::string FetchLatestVersion() {
+// ── Generic WinHTTP helpers ─────────────────────────────────
+
+// Perform a WinHTTP GET and collect the full response body.
+// |host|, |path| are the URL components; |secure| → HTTPS.
+// Returns true on success (HTTP 200), body in |outBody|.
+static bool WinHttpGet(const std::wstring& host,
+                       const std::wstring& path,
+                       bool secure,
+                       std::string& outBody)
+{
     HINTERNET hSession = WinHttpOpen(
         L"KeyboardSwitcher-UpdateCheck/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return "";
+    if (!hSession) return false;
 
     HINTERNET hConnect = WinHttpConnect(
-        hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+        hSession, host.c_str(),
+        secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
 
+    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"GET",
-        L"/repos/kertser/KeyboardSwitcher/releases/latest",
+        hConnect, L"GET", path.c_str(),
         nullptr, WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        return "";
+        return false;
     }
+
+    // Allow automatic redirects (WinHTTP follows them by default)
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY,
+                     &redirectPolicy, sizeof(redirectPolicy));
 
     BOOL ok = WinHttpSendRequest(hRequest,
         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -192,7 +213,7 @@ static std::string FetchLatestVersion() {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        return "";
+        return false;
     }
 
     ok = WinHttpReceiveResponse(hRequest, nullptr);
@@ -200,41 +221,218 @@ static std::string FetchLatestVersion() {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        return "";
+        return false;
     }
 
-    // Read response body
-    std::string response;
+    // Check HTTP status
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
+        WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Read body
+    outBody.clear();
     DWORD bytesAvailable = 0;
     do {
         bytesAvailable = 0;
         WinHttpQueryDataAvailable(hRequest, &bytesAvailable);
         if (bytesAvailable > 0) {
-            std::vector<char> buf(bytesAvailable + 1, 0);
+            std::vector<char> buf(bytesAvailable);
             DWORD bytesRead = 0;
             WinHttpReadData(hRequest, buf.data(), bytesAvailable, &bytesRead);
-            response.append(buf.data(), bytesRead);
+            outBody.append(buf.data(), bytesRead);
         }
     } while (bytesAvailable > 0);
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+    return true;
+}
 
-    // Parse JSON to extract tag_name
+// ── Fetch latest release info from GitHub API ───────────────
+
+// Queries api.github.com and fills |info| with version + download URL.
+// Returns true on success.
+static bool FetchLatestReleaseInfo(UpdateInfo& info) {
+    std::string body;
+    if (!WinHttpGet(L"api.github.com",
+                    L"/repos/kertser/KeyboardSwitcher/releases/latest",
+                    true, body))
+        return false;
+
     try {
-        auto j = nlohmann::json::parse(response);
+        auto j = nlohmann::json::parse(body);
+
+        // Extract version from tag_name (strip leading 'v')
         std::string tag = j.value("tag_name", "");
         if (!tag.empty() && (tag[0] == 'v' || tag[0] == 'V'))
             tag = tag.substr(1);
-        return tag;
+        if (tag.empty()) return false;
+        info.version = tag;
+
+        // Find the NSIS installer asset (*.exe)
+        info.downloadUrl.clear();
+        if (j.contains("assets") && j["assets"].is_array()) {
+            for (auto& asset : j["assets"]) {
+                std::string name = asset.value("name", "");
+                if (name.size() > 4 &&
+                    name.substr(name.size() - 4) == ".exe") {
+                    info.downloadUrl = asset.value(
+                        "browser_download_url", "");
+                    break;
+                }
+            }
+        }
+        // Fallback: construct URL from the tag
+        if (info.downloadUrl.empty()) {
+            info.downloadUrl =
+                "https://github.com/kertser/KeyboardSwitcher/releases/download/v"
+                + info.version + "/KeyboardSwitcher-" + info.version
+                + "-win64.exe";
+        }
+        return true;
     } catch (...) {
-        return "";
+        return false;
     }
 }
 
-// Forward declaration (used by update checker, defined here early)
+// ── Download a file from a URL to a local path ──────────────
+
+// Crack a full URL into host + path components.
+static bool CrackUrl(const std::string& url,
+                     std::wstring& host, std::wstring& path, bool& secure)
+{
+    std::wstring wUrl(url.begin(), url.end());
+    URL_COMPONENTS uc = {};
+    uc.dwStructSize = sizeof(uc);
+
+    wchar_t hostBuf[256] = {};
+    wchar_t pathBuf[2048] = {};
+    uc.lpszHostName    = hostBuf;
+    uc.dwHostNameLength = _countof(hostBuf);
+    uc.lpszUrlPath     = pathBuf;
+    uc.dwUrlPathLength = _countof(pathBuf);
+
+    if (!WinHttpCrackUrl(wUrl.c_str(), 0, 0, &uc))
+        return false;
+
+    host = hostBuf;
+    path = pathBuf;
+    secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    return true;
+}
+
+// Download |url| to |destPath|.  Follows redirects.
+// Returns true on success.
+static bool DownloadFileTo(const std::string& url,
+                           const std::wstring& destPath)
+{
+    std::wstring host, path;
+    bool secure = true;
+    if (!CrackUrl(url, host, path, secure))
+        return false;
+
+    HINTERNET hSession = WinHttpOpen(
+        L"KeyboardSwitcher-UpdateCheck/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession, host.c_str(),
+        secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"GET", path.c_str(),
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY,
+                     &redirectPolicy, sizeof(redirectPolicy));
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    ok = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Open local file
+    HANDLE hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0,
+                               nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Stream response to disk
+    bool success = true;
+    DWORD bytesAvailable = 0;
+    do {
+        bytesAvailable = 0;
+        WinHttpQueryDataAvailable(hRequest, &bytesAvailable);
+        if (bytesAvailable > 0) {
+            std::vector<char> buf(bytesAvailable);
+            DWORD bytesRead = 0;
+            if (WinHttpReadData(hRequest, buf.data(),
+                                bytesAvailable, &bytesRead)) {
+                DWORD written = 0;
+                if (!WriteFile(hFile, buf.data(), bytesRead,
+                               &written, nullptr) ||
+                    written != bytesRead) {
+                    success = false;
+                    break;
+                }
+            } else {
+                success = false;
+                break;
+            }
+        }
+    } while (bytesAvailable > 0);
+
+    CloseHandle(hFile);
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (!success) DeleteFileW(destPath.c_str());
+    return success;
+}
+
+// Forward declarations (used by update checker, defined here early)
 static HWND g_hwndHidden = nullptr;
+static TrayIcon g_trayIcon;
 
 // Run the update check in a background thread.
 // |manual| = true when the user clicked "Check for Updates".
@@ -243,17 +441,42 @@ static void CheckForUpdatesAsync(bool manual, int delaySec = 0) {
     g_updateCheckManual = manual;
     std::thread([delaySec]() {
         if (delaySec > 0) Sleep(delaySec * 1000);
-        g_latestVersionResult = FetchLatestVersion();
+        UpdateInfo info;
+        if (FetchLatestReleaseInfo(info))
+            g_updateInfo = info;
+        else
+            g_updateInfo = {};  // clear on failure
         if (g_hwndHidden)
             PostMessage(g_hwndHidden, WM_UPDATE_CHECK_RESULT, 0, 0);
     }).detach();
 }
 
+// Start downloading the installer in a background thread.
+static void DownloadUpdateAsync() {
+    std::thread([]() {
+        // Build destination path: %TEMP%\KeyboardSwitcher-X.Y.Z-win64.exe
+        wchar_t tempDir[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tempDir);
+        std::wstring dest = tempDir;
+        dest += L"KeyboardSwitcher-";
+        dest += std::wstring(g_updateInfo.version.begin(),
+                             g_updateInfo.version.end());
+        dest += L"-win64.exe";
+
+        bool ok = DownloadFileTo(g_updateInfo.downloadUrl, dest);
+        g_downloadedInstallerPath = ok ? dest : L"";
+        if (g_hwndHidden)
+            PostMessage(g_hwndHidden, WM_UPDATE_DOWNLOAD_DONE, 0, 0);
+    }).detach();
+}
+
 // Show the update-check result dialog on the UI thread.
 static void HandleUpdateCheckResult() {
-    std::string current(Config::VERSION,
-                        Config::VERSION + wcslen(Config::VERSION));
-    const std::string& latest = g_latestVersionResult;
+    // Narrow wchar_t version to std::string (ASCII digits + dots only)
+    std::string current;
+    for (const wchar_t* p = Config::VERSION; *p; ++p)
+        current += static_cast<char>(*p);
+    const std::string& latest = g_updateInfo.version;
 
     if (latest.empty()) {
         // Network failure — only report if the user asked explicitly
@@ -273,14 +496,14 @@ static void HandleUpdateCheckResult() {
             L"A new version is available!\n\n"
             L"Current version: v" + std::wstring(Config::VERSION) + L"\n"
             L"Latest version:  v" + std::wstring(latest.begin(), latest.end()) + L"\n\n"
-            L"Would you like to open the download page?";
+            L"Download and install now?";
         int res = MessageBoxW(nullptr, msg.c_str(),
             L"Keyboard Switcher \x2014 Update Available",
             MB_YESNO | MB_ICONINFORMATION);
         if (res == IDYES) {
-            ShellExecuteW(nullptr, L"open",
-                L"https://github.com/kertser/KeyboardSwitcher/releases/latest",
-                nullptr, nullptr, SW_SHOWNORMAL);
+            // Start downloading — the result arrives via
+            // WM_UPDATE_DOWNLOAD_DONE on the UI thread.
+            DownloadUpdateAsync();
         }
     } else {
         // Up to date — only show if the user asked explicitly
@@ -291,6 +514,38 @@ static void HandleUpdateCheckResult() {
                 L"Keyboard Switcher \x2014 Update Check",
                 MB_OK | MB_ICONINFORMATION);
         }
+    }
+}
+
+// Handle the completed download: launch the installer and exit.
+static void HandleUpdateDownloadDone() {
+    if (g_downloadedInstallerPath.empty()) {
+        MessageBoxW(nullptr,
+            L"Download failed.\n"
+            L"Please download the update manually from:\n"
+            L"https://github.com/kertser/KeyboardSwitcher/releases/latest",
+            L"Keyboard Switcher \x2014 Update",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Launch the installer — the NSIS installer handles closing
+    // the running instance and replacing the exe.
+    HINSTANCE hInst = ShellExecuteW(
+        nullptr, L"open",
+        g_downloadedInstallerPath.c_str(),
+        nullptr, nullptr, SW_SHOWNORMAL);
+
+    if ((INT_PTR)hInst > 32) {
+        // Installer launched successfully — exit so it can replace us
+        g_trayIcon.Remove();
+        PostQuitMessage(0);
+    } else {
+        MessageBoxW(nullptr,
+            L"Failed to launch the installer.\n"
+            L"The downloaded file is in your temp folder.",
+            L"Keyboard Switcher \x2014 Update",
+            MB_OK | MB_ICONERROR);
     }
 }
 
@@ -305,7 +560,7 @@ static InputCache          g_cache;
 static DetectionHistory    g_history;
 static WindowTracker*      g_windows = nullptr;
 static LanguageDetector*   g_detector = nullptr;
-static TrayIcon            g_trayIcon;
+// g_trayIcon is forward-declared above the update checker
 static std::atomic<bool>   g_isSendingInput{false}; // re-entrancy guard
 
 // Focus tracking — updated by HandleFocusChange(), read by hooks.
@@ -1510,6 +1765,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
     case WM_UPDATE_CHECK_RESULT:
         HandleUpdateCheckResult();
+        return 0;
+
+    case WM_UPDATE_DOWNLOAD_DONE:
+        HandleUpdateDownloadDone();
         return 0;
 
     case WM_TIMER:
