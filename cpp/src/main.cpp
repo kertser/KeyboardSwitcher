@@ -434,6 +434,14 @@ static bool DownloadFileTo(const std::string& url,
 static HWND g_hwndHidden = nullptr;
 static TrayIcon g_trayIcon;
 
+// ── Deferred clipboard restore ──────────────────────────────
+// After a clipboard-paste correction we delay restoring the
+// user's previous clipboard so the target app has enough time
+// to process the Ctrl+V.  Timer ID 2 fires once after 200 ms.
+static constexpr UINT_PTR TIMER_CLIPBOARD_RESTORE = 2;
+static std::wstring g_pendingClipRestore;
+static bool         g_hasPendingClipRestore = false;
+
 // Run the update check in a background thread.
 // |manual| = true when the user clicked "Check for Updates".
 // |delaySec| = seconds to wait before checking (used for startup delay).
@@ -918,7 +926,15 @@ static void SendString(const std::vector<wchar_t>& chars) {
     // ── Save existing clipboard text so we can restore it after paste ──
     std::wstring savedClipText;
     bool hadClipText = false;
-    {
+    if (g_hasPendingClipRestore) {
+        // A previous paste is still pending restore — carry forward
+        // the original user clipboard instead of reading the stale
+        // corrected text that's currently on the clipboard.
+        savedClipText = std::move(g_pendingClipRestore);
+        hadClipText   = !savedClipText.empty();
+        g_hasPendingClipRestore = false;
+        KillTimer(g_hwndHidden, TIMER_CLIPBOARD_RESTORE);
+    } else {
         HANDLE hData = GetClipboardData(CF_UNICODETEXT);
         if (hData) {
             const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(hData));
@@ -986,31 +1002,22 @@ static void SendString(const std::vector<wchar_t>& chars) {
 
     SendInput(4, inputs, sizeof(INPUT));
 
-    // Let the target app process the Ctrl+V
-    Sleep(30);
-
-    // ── Restore previous clipboard content ──
-    retries = 10;
-    while (!OpenClipboard(nullptr) && retries-- > 0) {
-        Sleep(10);
+    // ── Schedule deferred clipboard restore ──
+    // Don't restore immediately — the target app (especially Chrome,
+    // Electron, multi-process apps) may not have read the clipboard
+    // yet.  Instead, schedule a one-shot timer so the restore happens
+    // after the app has had enough time to process the Ctrl+V paste.
+    if (hadClipText && !savedClipText.empty()) {
+        g_pendingClipRestore   = std::move(savedClipText);
+        g_hasPendingClipRestore = true;
+    } else {
+        // Nothing to restore — just clear after a delay so the
+        // corrected text doesn't linger on the clipboard.
+        g_pendingClipRestore.clear();
+        g_hasPendingClipRestore = true;
     }
-    if (retries > 0) {
-        EmptyClipboard();
-        if (hadClipText && !savedClipText.empty()) {
-            size_t rSize = (savedClipText.size() + 1) * sizeof(wchar_t);
-            HGLOBAL hRestore = GlobalAlloc(GMEM_MOVEABLE, rSize);
-            if (hRestore) {
-                wchar_t* pRestore = static_cast<wchar_t*>(GlobalLock(hRestore));
-                if (pRestore) {
-                    memcpy(pRestore, savedClipText.c_str(), rSize);
-                    GlobalUnlock(hRestore);
-                    SetClipboardData(CF_UNICODETEXT, hRestore);
-                } else {
-                    GlobalFree(hRestore);
-                }
-            }
-        }
-        CloseClipboard();
+    if (g_hwndHidden) {
+        SetTimer(g_hwndHidden, TIMER_CLIPBOARD_RESTORE, 200, nullptr);
     }
 }
 
@@ -1772,6 +1779,38 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_TIMER:
+        if (wParam == TIMER_CLIPBOARD_RESTORE) {
+            // One-shot: kill the timer immediately
+            KillTimer(g_hwndHidden, TIMER_CLIPBOARD_RESTORE);
+
+            if (g_hasPendingClipRestore) {
+                g_hasPendingClipRestore = false;
+
+                int retries = 10;
+                while (!OpenClipboard(nullptr) && retries-- > 0)
+                    Sleep(10);
+                if (retries > 0) {
+                    EmptyClipboard();
+                    if (!g_pendingClipRestore.empty()) {
+                        size_t rSize = (g_pendingClipRestore.size() + 1) * sizeof(wchar_t);
+                        HGLOBAL hRestore = GlobalAlloc(GMEM_MOVEABLE, rSize);
+                        if (hRestore) {
+                            wchar_t* p = static_cast<wchar_t*>(GlobalLock(hRestore));
+                            if (p) {
+                                memcpy(p, g_pendingClipRestore.c_str(), rSize);
+                                GlobalUnlock(hRestore);
+                                SetClipboardData(CF_UNICODETEXT, hRestore);
+                            } else {
+                                GlobalFree(hRestore);
+                            }
+                        }
+                    }
+                    CloseClipboard();
+                }
+                g_pendingClipRestore.clear();
+            }
+            return 0;
+        }
         // Periodic cleanup of closed windows from the tracker
         if (g_windows) {
             g_windows->Cleanup();

@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.8
+# Keyboard Switcher v1.2.9
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -38,7 +38,7 @@ via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow/navigation keys, or manual layout switch |
-| **Clipboard preservation** | Clipboard content is saved before and restored after each correction paste, so your clipboard is never lost |
+| **Clipboard preservation** | Clipboard content is saved before and restored after each correction paste (via a 200 ms deferred timer), so your clipboard is never lost — even in multi-process apps like Chrome |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
 | **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
