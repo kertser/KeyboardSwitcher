@@ -22,6 +22,10 @@
 #include <fstream>
 #include <sstream>
 #include <cstdarg>
+#include <thread>
+
+#include <winhttp.h>
+#include <nlohmann/json.hpp>
 
 #include "Config.h"
 #include "Languages.h"
@@ -140,11 +144,162 @@ static void Dbg(const char* fmt, ...) {
 }
 
 // ============================================================
+// Update checker — queries GitHub for the latest release
+// ============================================================
+#define WM_UPDATE_CHECK_RESULT (WM_APP + 2)
+
+static std::string g_latestVersionResult;   // written by bg thread, read by UI thread
+static bool        g_updateCheckManual = false;  // true when user clicked "Check for Updates"
+
+// Compare semver strings "X.Y.Z". Returns >0 if a > b, 0 if equal, <0 if a < b.
+static int CompareVersions(const std::string& a, const std::string& b) {
+    int a1 = 0, a2 = 0, a3 = 0, b1 = 0, b2 = 0, b3 = 0;
+    sscanf(a.c_str(), "%d.%d.%d", &a1, &a2, &a3);
+    sscanf(b.c_str(), "%d.%d.%d", &b1, &b2, &b3);
+    if (a1 != b1) return a1 - b1;
+    if (a2 != b2) return a2 - b2;
+    return a3 - b3;
+}
+
+// Fetch the latest release version tag from GitHub (blocking network call).
+// Returns the version string (without leading 'v') or "" on failure.
+static std::string FetchLatestVersion() {
+    HINTERNET hSession = WinHttpOpen(
+        L"KeyboardSwitcher-UpdateCheck/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"GET",
+        L"/repos/kertser/KeyboardSwitcher/releases/latest",
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    ok = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    // Read response body
+    std::string response;
+    DWORD bytesAvailable = 0;
+    do {
+        bytesAvailable = 0;
+        WinHttpQueryDataAvailable(hRequest, &bytesAvailable);
+        if (bytesAvailable > 0) {
+            std::vector<char> buf(bytesAvailable + 1, 0);
+            DWORD bytesRead = 0;
+            WinHttpReadData(hRequest, buf.data(), bytesAvailable, &bytesRead);
+            response.append(buf.data(), bytesRead);
+        }
+    } while (bytesAvailable > 0);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    // Parse JSON to extract tag_name
+    try {
+        auto j = nlohmann::json::parse(response);
+        std::string tag = j.value("tag_name", "");
+        if (!tag.empty() && (tag[0] == 'v' || tag[0] == 'V'))
+            tag = tag.substr(1);
+        return tag;
+    } catch (...) {
+        return "";
+    }
+}
+
+// Forward declaration (used by update checker, defined here early)
+static HWND g_hwndHidden = nullptr;
+
+// Run the update check in a background thread.
+// |manual| = true when the user clicked "Check for Updates".
+// |delaySec| = seconds to wait before checking (used for startup delay).
+static void CheckForUpdatesAsync(bool manual, int delaySec = 0) {
+    g_updateCheckManual = manual;
+    std::thread([delaySec]() {
+        if (delaySec > 0) Sleep(delaySec * 1000);
+        g_latestVersionResult = FetchLatestVersion();
+        if (g_hwndHidden)
+            PostMessage(g_hwndHidden, WM_UPDATE_CHECK_RESULT, 0, 0);
+    }).detach();
+}
+
+// Show the update-check result dialog on the UI thread.
+static void HandleUpdateCheckResult() {
+    std::string current(Config::VERSION,
+                        Config::VERSION + wcslen(Config::VERSION));
+    const std::string& latest = g_latestVersionResult;
+
+    if (latest.empty()) {
+        // Network failure — only report if the user asked explicitly
+        if (g_updateCheckManual) {
+            MessageBoxW(nullptr,
+                L"Could not check for updates.\n"
+                L"Please verify your internet connection.",
+                L"Keyboard Switcher \x2014 Update Check",
+                MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
+
+    if (CompareVersions(latest, current) > 0) {
+        // Newer version available
+        std::wstring msg =
+            L"A new version is available!\n\n"
+            L"Current version: v" + std::wstring(Config::VERSION) + L"\n"
+            L"Latest version:  v" + std::wstring(latest.begin(), latest.end()) + L"\n\n"
+            L"Would you like to open the download page?";
+        int res = MessageBoxW(nullptr, msg.c_str(),
+            L"Keyboard Switcher \x2014 Update Available",
+            MB_YESNO | MB_ICONINFORMATION);
+        if (res == IDYES) {
+            ShellExecuteW(nullptr, L"open",
+                L"https://github.com/kertser/KeyboardSwitcher/releases/latest",
+                nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    } else {
+        // Up to date — only show if the user asked explicitly
+        if (g_updateCheckManual) {
+            MessageBoxW(nullptr,
+                (L"You are running the latest version (v" +
+                 std::wstring(Config::VERSION) + L").").c_str(),
+                L"Keyboard Switcher \x2014 Update Check",
+                MB_OK | MB_ICONINFORMATION);
+        }
+    }
+}
+
+// ============================================================
 // Globals
 // ============================================================
 static HHOOK g_keyboardHook = nullptr;
 static HHOOK g_mouseHook = nullptr;
-static HWND  g_hwndHidden = nullptr;
+// g_hwndHidden is forward-declared above the update checker
 
 static InputCache          g_cache;
 static DetectionHistory    g_history;
@@ -1297,6 +1452,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     ID_TRAY_DEBUG_LOG, L"Debug Log");
 
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_CHECK_UPDATE, L"Check for Updates\x2026");
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"About");
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -1337,6 +1493,9 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 (std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
                 MB_OK | MB_ICONINFORMATION);
             break;
+        case ID_TRAY_CHECK_UPDATE:
+            CheckForUpdatesAsync(true);
+            break;
         case ID_TRAY_EXIT:
             g_trayIcon.Remove();
             PostQuitMessage(0);
@@ -1347,6 +1506,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_DESTROY:
         g_trayIcon.Remove();
         PostQuitMessage(0);
+        return 0;
+
+    case WM_UPDATE_CHECK_RESULT:
+        HandleUpdateCheckResult();
         return 0;
 
     case WM_TIMER:
@@ -1460,6 +1623,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         nullptr, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    // Check for updates in the background (3-second delay so the app
+    // starts up smoothly; silent if already on the latest version).
+    CheckForUpdatesAsync(false, 3);
 
     // Message loop (required for low-level hooks to work)
     MSG msg;

@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.7
+# Keyboard Switcher v1.2.8
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -51,6 +51,7 @@ via ONNX Runtime.
 | **Debug log** | Toggle from the tray menu — timestamped entries written to `ks_debug.log` next to the exe (auto-rolls at 512 KB) |
 | **Alt+Tab awareness** | Restores the per-window language after Alt+Tab switching |
 | **Edge-case filtering** | Skips detection for URLs, file paths, and mostly non-alphabetic input |
+| **Auto-update check** | On startup (after a short delay) and via _Check for Updates_ in the tray menu, the app queries the latest GitHub release and offers to open the download page when a newer version is available |
 | **Input collision guard** | Blocks real keystrokes during the retyping phase to prevent garbled output |
 
 ## Project Structure
@@ -202,8 +203,9 @@ cpack -G NSIS       # installer (requires NSIS)
 3. The switcher detects the intended language and corrects the input automatically.
 4. **Press Esc** to undo the last correction (works even after typing more — up to 100 extra characters).
 5. **Left-click** the tray icon to adjust confidence thresholds via sliders.
-6. **Right-click** the tray icon to enable/disable the switcher, toggle per-window memory, typo resilience, debug log, or exit.
+6. **Right-click** the tray icon to enable/disable the switcher, toggle per-window memory, typo resilience, debug log, check for updates, or exit.
 7. Hover the tray icon to see the current keyboard layout.
+8. On startup the app silently checks GitHub for a newer release; if one is found you are prompted to open the download page. You can also check manually via **Check for Updates…** in the tray menu.
 
 ## Contributing
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(KeyboardSwitcher VERSION 1.2.7 LANGUAGES CXX)
+project(KeyboardSwitcher VERSION 1.2.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -108,6 +108,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     shell32
     comctl32
     dwmapi
+    winhttp
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
