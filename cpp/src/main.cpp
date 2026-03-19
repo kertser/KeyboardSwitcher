@@ -753,6 +753,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         g_lastCorrection.valid = false;
     }
 
+    // --- Arrow / navigation keys break word continuity ---
+    if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
+        vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT) {
+        g_cache.Clear();
+        g_history.Clear();
+        g_lastCorrection.valid = false;
+        Dbg("NAV-KEY: vk=0x%02X — cache cleared", vk);
+    }
+
     // --- Invalidate undo on paragraph break or buffer overflow ---
     if (g_lastCorrection.valid && vk != VK_ESCAPE) {
         if (vk == VK_RETURN ||

@@ -37,7 +37,7 @@ via ONNX Runtime.
 | Feature | Description |
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
-| **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, or manual layout switch |
+| **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow/navigation keys, or manual layout switch |
 | **Clipboard preservation** | Clipboard content is saved before and restored after each correction paste, so your clipboard is never lost |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
