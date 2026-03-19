@@ -1,0 +1,11 @@
+# Model inference / tuning
+numpy
+onnxruntime
+
+# Model training (LangModel.ipynb)
+# pandas
+# scikit-learn
+# tensorboard
+# python-Levenshtein
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
