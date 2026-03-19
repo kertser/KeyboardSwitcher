@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.6
+# Keyboard Switcher v1.2.7
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -37,14 +37,18 @@ via ONNX Runtime.
 | Feature | Description |
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
+| **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, or manual layout switch |
+| **Clipboard preservation** | Clipboard content is saved before and restored after each correction paste, so your clipboard is never lost |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
 | **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
-| **Per-window language memory** | Remembers the language for each window and restores it on focus change |
+| **Per-window language memory** | Remembers the language for each window/tab and restores it on focus change |
 | **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), detection is paused until the next mouse click |
 | **Capitalization preservation** | If the first letter was typed with Shift, the corrected text keeps the capital letter |
 | **Dynamic tray tooltip** | Hovering the tray icon shows the current language (e.g. "Keyboard Switcher — English") |
-| **System tray menu** | Right-click to enable/disable the switcher, toggle window-state saving, or exit |
+| **Confidence tuning** | Left-click the tray icon to adjust short/long text confidence thresholds via sliders |
+| **System tray menu** | Right-click to enable/disable the switcher, toggle window-state saving, typo resilience, debug log, or exit |
+| **Debug log** | Toggle from the tray menu — timestamped entries written to `ks_debug.log` next to the exe (auto-rolls at 512 KB) |
 | **Alt+Tab awareness** | Restores the per-window language after Alt+Tab switching |
 | **Edge-case filtering** | Skips detection for URLs, file paths, and mostly non-alphabetic input |
 | **Input collision guard** | Blocks real keystrokes during the retyping phase to prevent garbled output |
@@ -196,8 +200,10 @@ cpack -G NSIS       # installer (requires NSIS)
 1. Run the program — it appears as a tray icon.
 2. Click on a text area and start typing.
 3. The switcher detects the intended language and corrects the input automatically.
-4. Right-click the tray icon to enable/disable the switcher or toggle per-window memory.
-5. Hover the tray icon to see the current keyboard layout.
+4. **Press Esc** to undo the last correction (works even after typing more — up to 100 extra characters).
+5. **Left-click** the tray icon to adjust confidence thresholds via sliders.
+6. **Right-click** the tray icon to enable/disable the switcher, toggle per-window memory, typo resilience, debug log, or exit.
+7. Hover the tray icon to see the current keyboard layout.
 
 ## Contributing
 

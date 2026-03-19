@@ -160,6 +160,22 @@ static size_t        g_lastContextHash    = 0;
 static HWINEVENTHOOK g_winEventHook       = nullptr;
 
 // ============================================================
+// Last correction state for Esc-to-undo
+// ============================================================
+struct LastCorrectionInfo {
+    std::wstring originalText;      // mistyped chars (what was on screen)
+    std::wstring correctedText;     // what was pasted as replacement
+    std::string  originalLang;      // keyboard layout before correction
+    std::string  correctedLang;     // keyboard layout after correction
+    HWND         hwnd = nullptr;    // window where correction happened
+    size_t       ctxHash = 0;       // context hash
+    std::vector<wchar_t> postChars; // chars typed after correction (for buffered undo)
+    bool         valid = false;     // is undo available?
+};
+static LastCorrectionInfo g_lastCorrection;
+static constexpr size_t MAX_UNDO_POST_CHARS = 100;
+
+// ============================================================
 // Helper: get the executable directory
 // ============================================================
 static std::wstring GetExeDirectory() {
@@ -354,6 +370,9 @@ static void HandleFocusChange(bool forceSearch = false) {
         forceSearch, g_cache.Size());
 
     if (contextChanged) {
+        // Invalidate undo — user moved to a different context
+        g_lastCorrection.valid = false;
+
         size_t prevCtxHash = g_lastContextHash;
         HWND prevHwnd = g_lastForegroundHwnd;
 
@@ -423,6 +442,7 @@ static void HandleFocusChange(bool forceSearch = false) {
             g_cache.Clear();
             g_history.Clear();
             Config::SEARCH.store(true);
+            g_lastCorrection.valid = false;
             Dbg("FORCE-SEARCH: click in same context, SEARCH=1");
         } else {
             // Just position change (e.g. arrow keys), keep state
@@ -485,6 +505,21 @@ static void SendString(const std::vector<wchar_t>& chars) {
         return;
     }
 
+    // ── Save existing clipboard text so we can restore it after paste ──
+    std::wstring savedClipText;
+    bool hadClipText = false;
+    {
+        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+        if (hData) {
+            const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(hData));
+            if (p) {
+                savedClipText = p;
+                hadClipText = true;
+                GlobalUnlock(hData);
+            }
+        }
+    }
+
     EmptyClipboard();
 
     // Allocate and copy text to clipboard
@@ -543,6 +578,30 @@ static void SendString(const std::vector<wchar_t>& chars) {
 
     // Let the target app process the Ctrl+V
     Sleep(30);
+
+    // ── Restore previous clipboard content ──
+    retries = 10;
+    while (!OpenClipboard(nullptr) && retries-- > 0) {
+        Sleep(10);
+    }
+    if (retries > 0) {
+        EmptyClipboard();
+        if (hadClipText && !savedClipText.empty()) {
+            size_t rSize = (savedClipText.size() + 1) * sizeof(wchar_t);
+            HGLOBAL hRestore = GlobalAlloc(GMEM_MOVEABLE, rSize);
+            if (hRestore) {
+                wchar_t* pRestore = static_cast<wchar_t*>(GlobalLock(hRestore));
+                if (pRestore) {
+                    memcpy(pRestore, savedClipText.c_str(), rSize);
+                    GlobalUnlock(hRestore);
+                    SetClipboardData(CF_UNICODETEXT, hRestore);
+                } else {
+                    GlobalFree(hRestore);
+                }
+            }
+        }
+        CloseClipboard();
+    }
 }
 
 // ============================================================
@@ -631,6 +690,77 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     DWORD vk = pKb->vkCode;
 
+    // --- Esc to undo the last correction ---
+    if (vk == VK_ESCAPE && g_lastCorrection.valid) {
+        // Only undo if still in the same window
+        if (GetForegroundWindow() == g_lastCorrection.hwnd) {
+            // Convert post-correction chars back to original language
+            std::wstring postText(g_lastCorrection.postChars.begin(),
+                                  g_lastCorrection.postChars.end());
+            std::wstring convertedPost;
+            if (!postText.empty()) {
+                convertedPost = ConvertTextBidirectional(
+                    postText,
+                    Layouts::GetLayoutForLanguage(g_lastCorrection.correctedLang),
+                    Layouts::GetLayoutForLanguage(g_lastCorrection.originalLang));
+            }
+
+            Dbg("UNDO: reverting '%s'+'%s' back to '%s'+'%s', lang %s -> %s",
+                ws2s(g_lastCorrection.correctedText).c_str(),
+                ws2s(postText).c_str(),
+                ws2s(g_lastCorrection.originalText).c_str(),
+                ws2s(convertedPost).c_str(),
+                g_lastCorrection.correctedLang.c_str(),
+                g_lastCorrection.originalLang.c_str());
+
+            g_isSendingInput.store(true);
+            BOOL blocked = BlockInput(TRUE);
+
+            // Remove corrected text + any post-correction characters
+            size_t totalChars = g_lastCorrection.correctedText.size()
+                              + g_lastCorrection.postChars.size();
+            SendBackspaces(totalChars);
+
+            // Switch back to original language
+            ChangeKeyboardLayout(g_lastCorrection.originalLang);
+
+            // Retype original text + converted post-correction text
+            std::wstring fullOriginal = g_lastCorrection.originalText + convertedPost;
+            std::vector<wchar_t> origChars(fullOriginal.begin(), fullOriginal.end());
+            SendString(origChars);
+
+            if (blocked) BlockInput(FALSE);
+            g_isSendingInput.store(false);
+
+            // Restore saved window state to original language
+            if (g_windows && Config::SaveWindowState.load()) {
+                g_windows->SetLanguage(g_lastCorrection.hwnd,
+                                       g_lastCorrection.ctxHash,
+                                       g_lastCorrection.originalLang);
+            }
+            Config::LastSetting = g_lastCorrection.originalLang;
+
+            // Disable detection — user explicitly chose to keep their text
+            Config::SEARCH.store(false);
+            g_cache.Clear();
+            g_history.Clear();
+
+            g_lastCorrection.valid = false;
+            UpdateTrayTooltip();
+
+            return 1; // block the Esc key
+        }
+        g_lastCorrection.valid = false;
+    }
+
+    // --- Invalidate undo on paragraph break or buffer overflow ---
+    if (g_lastCorrection.valid && vk != VK_ESCAPE) {
+        if (vk == VK_RETURN ||
+            g_lastCorrection.postChars.size() >= MAX_UNDO_POST_CHARS) {
+            g_lastCorrection.valid = false;
+        }
+    }
+
     // --- Focus-change detection (belt-and-suspenders) ---
     // EVENT_SYSTEM_FOREGROUND handles most focus changes, but we
     // also check here to catch edge cases where the WinEvent
@@ -693,6 +823,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     g_cache.Clear();
                     g_history.Clear();
                     Config::SEARCH.store(false);
+                    g_lastCorrection.valid = false;
                     UpdateTrayTooltip();
                 }
             }
@@ -706,8 +837,18 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     if (vk == VK_BACK) {
         g_cache.DelChar();
+        // Undo buffer: pop last post-correction char, or invalidate
+        // if backspace reaches into the corrected text itself
+        if (g_lastCorrection.valid) {
+            if (!g_lastCorrection.postChars.empty())
+                g_lastCorrection.postChars.pop_back();
+            else
+                g_lastCorrection.valid = false;
+        }
     } else if (vk == VK_SPACE) {
         g_cache.PushChar(L' ', false);
+        if (g_lastCorrection.valid)
+            g_lastCorrection.postChars.push_back(L' ');
     } else if (vk == VK_RETURN) {
         // Enter: placeholder (same as Python version)
     } else if ((vk >= 0x30 && vk <= 0x5A) || (vk >= VK_OEM_1 && vk <= VK_OEM_3) ||
@@ -715,6 +856,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         wchar_t ch = VkToWchar(vk);
         if (ch != 0) {
             g_cache.PushChar(ch, isUpperIntent);
+            if (g_lastCorrection.valid)
+                g_lastCorrection.postChars.push_back(ch);
         }
     }
 
@@ -823,6 +966,17 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (blocked) BlockInput(FALSE);
                     g_isSendingInput.store(false);
                     didCorrection = true;
+
+                    // Save correction info for Esc-to-undo
+                    g_lastCorrection.originalText  = cachedText;
+                    g_lastCorrection.correctedText = correctedText;
+                    g_lastCorrection.originalLang  = currentLangId;
+                    g_lastCorrection.correctedLang = bestLang;
+                    g_lastCorrection.hwnd          = g_lastForegroundHwnd;
+                    g_lastCorrection.ctxHash       = g_lastContextHash;
+                    g_lastCorrection.postChars.clear();
+                    g_lastCorrection.valid         = true;
+
                     UpdateTrayTooltip();
                 }
 
@@ -1165,8 +1319,12 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             break;
         case ID_TRAY_ABOUT:
-            g_trayIcon.ShowBalloon((std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
-                                   L"Click on text area and start typing");
+            g_trayIcon.ShowBalloon(
+                (std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
+                L"Auto-detects En/He/Ru and corrects layout.\n"
+                L"Esc \x2014 undo last correction\n"
+                L"Left-click tray \x2014 confidence sliders\n"
+                L"Right-click tray \x2014 settings");
             break;
         case ID_TRAY_EXIT:
             g_trayIcon.Remove();
