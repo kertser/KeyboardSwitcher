@@ -1319,12 +1319,14 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             break;
         case ID_TRAY_ABOUT:
-            g_trayIcon.ShowBalloon(
-                (std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
-                L"Auto-detects En/He/Ru and corrects layout.\n"
+            MessageBoxW(nullptr,
+                L"Auto-detects En/He/Ru and corrects layout.\n\n"
                 L"Esc \x2014 undo last correction\n"
                 L"Left-click tray \x2014 confidence sliders\n"
-                L"Right-click tray \x2014 settings");
+                L"Right-click tray \x2014 settings\n\n"
+                L"\x00A9 2025-2026 Alpha-Numerical",
+                (std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
+                MB_OK | MB_ICONINFORMATION);
             break;
         case ID_TRAY_EXIT:
             g_trayIcon.Remove();
