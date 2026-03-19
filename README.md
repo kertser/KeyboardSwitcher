@@ -8,7 +8,7 @@ Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on 
 - [Project Description](#project-description)
 - [Features](#features)
 - [Project Structure](#project-structure)
-- [Python Version](#python-version)
+- [Model Training & Export](#model-training--export)
 - [C++ Version](#c-version)
 - [Packaging / Installer](#packaging--installer)
 - [Windows Defender / SmartScreen](#windows-defender--smartscreen)
@@ -58,18 +58,20 @@ via ONNX Runtime.
 
 ```
 KeyboardSwitcher/
-├── python/                  # Original Python implementation + model training
-│   ├── main.py
-│   ├── config.py
-│   ├── Languages.py
-│   ├── Languages_torch.py
-│   ├── convert_to_onnx.py
-│   ├── LangModel.ipynb
+├── model/                   # Model training, export & tuning (Python)
+│   ├── LangModel.ipynb      # Training notebook (PyTorch LSTM)
+│   ├── convert_to_onnx.py   # Export trained model to ONNX
+│   ├── Languages.py         # ONNX inference & layout utilities
+│   ├── Languages_torch.py   # PyTorch model class & inference
+│   ├── tune_confidence.py   # Offline confidence-threshold tuning
 │   ├── requirements.txt
+│   ├── dictionary.json
 │   ├── dictionary.pkl
+│   ├── lang_model.onnx
 │   ├── lang_model.pth
+│   ├── results_test.csv
 │   └── vocabulary/
-├── cpp/                     # C++ (Win32) implementation
+├── cpp/                     # C++ (Win32) production app
 │   ├── CMakeLists.txt
 │   ├── build_release.bat    # One-click release build & package script
 │   ├── lang_model.onnx
@@ -98,13 +100,28 @@ KeyboardSwitcher/
 └── README.md
 ```
 
-## Python Version
+## Model Training & Export
+
+The `model/` directory contains the PyTorch LSTM training pipeline and supporting utilities.
+The C++ app does **not** depend on Python at runtime — it uses the exported ONNX model.
 
 ```bash
-cd python
+cd model
 pip install -r requirements.txt
-python main.py
+# Train the model in LangModel.ipynb, then export:
+python convert_to_onnx.py
+# Copy lang_model.onnx and dictionary.json into cpp/
 ```
+
+Key files:
+| File | Purpose |
+|---|---|
+| `LangModel.ipynb` | Training notebook (PyTorch LSTM) |
+| `convert_to_onnx.py` | Export `.pth` → `.onnx` |
+| `Languages.py` | ONNX inference & keyboard-layout conversion utilities |
+| `Languages_torch.py` | PyTorch model class (used during training & export) |
+| `tune_confidence.py` | Offline grid-search for adaptive confidence-curve parameters |
+| `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
 ## C++ Version
 
