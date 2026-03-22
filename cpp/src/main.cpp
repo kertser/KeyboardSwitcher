@@ -1002,6 +1002,13 @@ static void SendString(const std::vector<wchar_t>& chars) {
 
     SendInput(4, inputs, sizeof(INPUT));
 
+    // Give the target app time to dequeue and process the Ctrl+V
+    // paste before we schedule clipboard restoration.  Multi-process
+    // apps (Chrome, Electron) need extra time because the browser
+    // process forwards the input event to the renderer via IPC
+    // before the renderer actually opens the clipboard.
+    Sleep(50);
+
     // ── Schedule deferred clipboard restore ──
     // Don't restore immediately — the target app (especially Chrome,
     // Electron, multi-process apps) may not have read the clipboard
@@ -1017,7 +1024,7 @@ static void SendString(const std::vector<wchar_t>& chars) {
         g_hasPendingClipRestore = true;
     }
     if (g_hwndHidden) {
-        SetTimer(g_hwndHidden, TIMER_CLIPBOARD_RESTORE, 200, nullptr);
+        SetTimer(g_hwndHidden, TIMER_CLIPBOARD_RESTORE, 500, nullptr);
     }
 }
 
