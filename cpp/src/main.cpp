@@ -1087,6 +1087,40 @@ static wchar_t VkToWchar(DWORD vkCode) {
 }
 
 // ============================================================
+// Helper: detect "leaked" characters in a layout conversion
+// ============================================================
+// A leaked character is one that exists in the source layout but
+// has no corresponding position in the target layout (because the
+// target is shorter — e.g. Hebrew has 35 chars vs English/Russian's
+// 70).  These characters pass through ConvertText unchanged,
+// producing mixed-script variants that confuse the model.
+//
+// Only relevant when target.size() < source.size(); same-size or
+// target-larger layouts always have full coverage.
+static bool HasLeakedLayoutChars(const std::wstring& text,
+                                  const std::wstring& fromLayout,
+                                  const std::wstring& toLayout) {
+    // Optimisation: leaks are impossible when target is as large as source
+    if (toLayout.size() >= fromLayout.size()) return false;
+
+    // Mirror ConvertTextBidirectional: lowercase when target is Hebrew
+    std::wstring input = text;
+    if (&toLayout == &Layouts::hebrew_layout || toLayout == Layouts::hebrew_layout) {
+        for (auto& ch : input) ch = towlower(ch);
+    }
+
+    auto map = CreateConversionMap(fromLayout, toLayout);
+    for (wchar_t ch : input) {
+        // Character is in the source layout but has no mapping to target
+        if (fromLayout.find(ch) != std::wstring::npos &&
+            map.find(ch) == map.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================
 // Low-level keyboard hook procedure
 // ============================================================
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -1224,10 +1258,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // --- Track manual layout changes ---
     // If the user manually switched the layout (e.g. Alt+Shift),
-    // update the saved language and disable detection — the user
-    // already chose a language.  Only applies when a language was
-    // previously confirmed; for unvisited contexts detection will
-    // handle whatever layout the user is on.
+    // update the saved language and keep detection active so we can
+    // catch layout mistakes (user switched but still types in the
+    // previous language).  Cache and history are cleared so detection
+    // starts fresh on the new keystrokes.
     {
         if (g_windows && g_lastForegroundHwnd) {
             std::string windowLang =
@@ -1255,7 +1289,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     Config::LastSetting = currentLayout;
                     g_cache.Clear();
                     g_history.Clear();
-                    Config::SEARCH.store(false);
+                    Config::SEARCH.store(true);
                     g_lastCorrection.valid = false;
                     UpdateTrayTooltip();
                 }
@@ -1326,15 +1360,30 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
 
         if (!shouldSkip) {
-            // Generate all 6 layout conversion variants (same order as Python)
-            std::vector<std::wstring> textVariants = {
-                ConvertTextBidirectional(text, Layouts::english_layout, Layouts::russian_layout),
-                ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::english_layout),
-                ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::english_layout),
-                ConvertTextBidirectional(text, Layouts::english_layout, Layouts::hebrew_layout),
-                ConvertTextBidirectional(text, Layouts::russian_layout, Layouts::hebrew_layout),
-                ConvertTextBidirectional(text, Layouts::hebrew_layout,  Layouts::russian_layout),
+            // Generate layout conversion variants, skipping those where
+            // source-layout characters can't map to the target layout
+            // (e.g. shifted English chars have no Hebrew equivalent).
+            struct ConvPair {
+                const std::wstring& from;
+                const std::wstring& to;
             };
+            ConvPair convPairs[] = {
+                { Layouts::english_layout, Layouts::russian_layout },
+                { Layouts::russian_layout, Layouts::english_layout },
+                { Layouts::hebrew_layout,  Layouts::english_layout },
+                { Layouts::english_layout, Layouts::hebrew_layout  },
+                { Layouts::russian_layout, Layouts::hebrew_layout  },
+                { Layouts::hebrew_layout,  Layouts::russian_layout },
+            };
+
+            std::vector<std::wstring> textVariants;
+            for (const auto& cp : convPairs) {
+                if (HasLeakedLayoutChars(text, cp.from, cp.to)) {
+                    continue;   // skip lossy conversion
+                }
+                textVariants.push_back(
+                    ConvertTextBidirectional(text, cp.from, cp.to));
+            }
 
             // Deduplicate (preserving first occurrence order)
             {
