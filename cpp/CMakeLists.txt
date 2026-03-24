@@ -32,6 +32,10 @@ find_path(ONNXRUNTIME_INCLUDE_DIR
     PATHS "${ONNXRUNTIME_ROOT}/include"
     NO_DEFAULT_PATH
 )
+# On MinGW, find_library won't find .lib files by default, so add .lib suffix
+if(MINGW)
+    list(APPEND CMAKE_FIND_LIBRARY_SUFFIXES ".lib")
+endif()
 find_library(ONNXRUNTIME_LIBRARY
     NAMES onnxruntime
     PATHS "${ONNXRUNTIME_ROOT}/lib"
