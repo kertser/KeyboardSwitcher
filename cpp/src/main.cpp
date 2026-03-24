@@ -571,6 +571,12 @@ static HWND          g_lastForegroundHwnd = nullptr;
 static size_t        g_lastContextHash    = 0;
 static HWINEVENTHOOK g_winEventHook       = nullptr;
 
+// Post-correction grace period: suppress false manual-switch detection
+// when the target window (e.g. a file dialog) reverts our layout change.
+static DWORD         g_lastCorrectionTick = 0;       // GetTickCount() at correction time
+static std::string   g_lastCorrectionLang;            // language we switched TO
+static constexpr DWORD CORRECTION_GRACE_MS = 1000;    // 1 second grace period
+
 // ============================================================
 // Last correction state for Esc-to-undo
 // ============================================================
@@ -741,6 +747,15 @@ static void ChangeKeyboardLayout(const std::string& lang) {
     // Use SendMessage (synchronous) so the layout is guaranteed to
     // have changed by the time this function returns.
     SendMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
+
+    // Some windows (e.g. common file dialogs) have a child edit
+    // control on a separate thread that may not honour the top-level
+    // WM_INPUTLANGCHANGEREQUEST.  Post the request to the focused
+    // child as well to maximise coverage.
+    HWND child = GetFocusedChildHwnd(hwnd);
+    if (child && child != hwnd) {
+        PostMessage(child, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
+    }
 }
 
 // ============================================================
@@ -784,6 +799,10 @@ static void HandleFocusChange(bool forceSearch = false) {
     if (contextChanged) {
         // Invalidate undo — user moved to a different context
         g_lastCorrection.valid = false;
+
+        // Expire any post-correction grace period
+        g_lastCorrectionTick = 0;
+        g_lastCorrectionLang.clear();
 
         size_t prevCtxHash = g_lastContextHash;
         HWND prevHwnd = g_lastForegroundHwnd;
@@ -1122,6 +1141,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             if (blocked) BlockInput(FALSE);
             g_isSendingInput.store(false);
 
+            // Record undo time for the grace-period guard
+            g_lastCorrectionTick = GetTickCount();
+            g_lastCorrectionLang = g_lastCorrection.originalLang;
+
             // Restore saved window state to original language
             if (g_windows && Config::SaveWindowState.load()) {
                 g_windows->SetLanguage(g_lastCorrection.hwnd,
@@ -1201,29 +1224,62 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             if (!windowLang.empty()) {
                 std::string currentLayout = GetCurrentKeyboardLayout();
                 if (windowLang != currentLayout) {
-                    // Layout changed since last confirmed → manual switch
-                    Dbg("MANUAL-SWITCH: %s → %s for hwnd=%p ctxHash=%zu",
-                        windowLang.c_str(), currentLayout.c_str(),
-                        g_lastForegroundHwnd, g_lastContextHash);
+                    // Check if we're within the post-correction grace
+                    // period.  Some windows (e.g. common file dialogs)
+                    // revert the layout change we applied during
+                    // correction.  In that case re-apply the layout
+                    // instead of treating this as a manual switch.
+                    DWORD now = GetTickCount();
+                    bool inGracePeriod =
+                        (g_lastCorrectionTick != 0 &&
+                         !g_lastCorrectionLang.empty() &&
+                         (now - g_lastCorrectionTick) < CORRECTION_GRACE_MS &&
+                         windowLang == g_lastCorrectionLang);
 
-                    if (Config::SaveWindowState.load()) {
-                        g_windows->SetLanguage(g_lastForegroundHwnd,
-                                               g_lastContextHash, currentLayout);
+                    if (inGracePeriod) {
+                        Dbg("GRACE-REAPPLY: window reverted %s → %s within %lu ms of correction, re-applying %s",
+                            windowLang.c_str(), currentLayout.c_str(),
+                            (unsigned long)(now - g_lastCorrectionTick),
+                            g_lastCorrectionLang.c_str());
 
-                        // Also save under live hash if different
-                        size_t liveCtxHash = GetWindowContextHash(g_lastForegroundHwnd);
-                        if (liveCtxHash != g_lastContextHash) {
+                        // Re-apply the layout change
+                        ChangeKeyboardLayout(g_lastCorrectionLang);
+
+                        // Expire the grace period so we don't loop
+                        g_lastCorrectionTick = 0;
+                        g_lastCorrectionLang.clear();
+
+                        // Don't disable detection — this was not a
+                        // deliberate user action.
+                    } else {
+                        // Layout changed since last confirmed → manual switch
+                        Dbg("MANUAL-SWITCH: %s → %s for hwnd=%p ctxHash=%zu",
+                            windowLang.c_str(), currentLayout.c_str(),
+                            g_lastForegroundHwnd, g_lastContextHash);
+
+                        // Expire any lingering grace period
+                        g_lastCorrectionTick = 0;
+                        g_lastCorrectionLang.clear();
+
+                        if (Config::SaveWindowState.load()) {
                             g_windows->SetLanguage(g_lastForegroundHwnd,
-                                                   liveCtxHash, currentLayout);
-                            g_lastContextHash = liveCtxHash;
+                                                   g_lastContextHash, currentLayout);
+
+                            // Also save under live hash if different
+                            size_t liveCtxHash = GetWindowContextHash(g_lastForegroundHwnd);
+                            if (liveCtxHash != g_lastContextHash) {
+                                g_windows->SetLanguage(g_lastForegroundHwnd,
+                                                       liveCtxHash, currentLayout);
+                                g_lastContextHash = liveCtxHash;
+                            }
                         }
+                        Config::LastSetting = currentLayout;
+                        g_cache.Clear();
+                        g_history.Clear();
+                        Config::SEARCH.store(false);
+                        g_lastCorrection.valid = false;
+                        UpdateTrayTooltip();
                     }
-                    Config::LastSetting = currentLayout;
-                    g_cache.Clear();
-                    g_history.Clear();
-                    Config::SEARCH.store(false);
-                    g_lastCorrection.valid = false;
-                    UpdateTrayTooltip();
                 }
             }
         }
@@ -1480,6 +1536,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (blocked) BlockInput(FALSE);
                     g_isSendingInput.store(false);
                     didCorrection = true;
+
+                    // Record correction time for the grace-period guard
+                    // against false manual-switch detection (windows that
+                    // revert our WM_INPUTLANGCHANGEREQUEST).
+                    g_lastCorrectionTick = GetTickCount();
+                    g_lastCorrectionLang = bestLang;
 
                     // Save correction info for Esc-to-undo
                     g_lastCorrection.originalText  = cachedText;
