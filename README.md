@@ -43,7 +43,8 @@ via ONNX Runtime.
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
 | **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
 | **Per-window language memory** | Remembers the language for each window/tab and restores it on focus change |
-| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), detection is paused until the next mouse click |
+| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), the saved language is updated and detection stays active to catch layout mistakes |
+| **LED state indicator** | Tray icon shows a glowing red dot while the language is undetected, switching to green once the language is detected or manually confirmed |
 | **Capitalization preservation** | If the first letter was typed with Shift, the corrected text keeps the capital letter |
 | **Dynamic tray tooltip** | Hovering the tray icon shows the current language (e.g. "Keyboard Switcher — English") |
 | **Confidence tuning** | Left-click the tray icon to adjust short/long text confidence thresholds via sliders |
@@ -215,7 +216,7 @@ cpack -G NSIS       # installer (requires NSIS)
 ```
 
 ## Usage
-1. Run the program — it appears as a tray icon.
+1. Run the program — it appears as a tray icon with a coloured LED dot: **red** while the language is undetected, **green** once detected or manually confirmed.
 2. Click on a text area and start typing.
 3. The switcher detects the intended language and corrects the input automatically.
 4. **Press Esc** to undo the last correction (works even after typing more — up to 100 extra characters).
