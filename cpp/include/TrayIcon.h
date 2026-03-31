@@ -22,6 +22,9 @@ public:
     // Update the hover tooltip text
     void UpdateTooltip(const std::wstring& text);
 
+    // Change the displayed icon (e.g. to reflect detection state)
+    void UpdateIcon(HICON hIcon);
+
 private:
     NOTIFYICONDATAW nid_ = {};
     bool created_ = false;

@@ -635,6 +635,158 @@ static void UpdateTrayTooltip() {
 }
 
 // ============================================================
+// LED overlay icons for detection state indication
+// ============================================================
+// Red   = language undetected (SEARCH active)
+// Green = language detected / manually confirmed
+// ============================================================
+static HICON g_baseIcon  = nullptr;
+static HICON g_iconRed   = nullptr;   // SEARCH = true  (undetected)
+static HICON g_iconGreen = nullptr;   // SEARCH = false (detected)
+
+// Create an icon with a glowing LED circle in the bottom-right corner.
+// Uses direct 32-bit ARGB pixel manipulation so the alpha channel is
+// set correctly (GDI drawing functions like Ellipse leave alpha at 0).
+static HICON CreateLedIcon(HICON baseIcon, COLORREF ledColor) {
+    // Get the base icon's actual dimensions
+    ICONINFO baseInfo = {};
+    if (!GetIconInfo(baseIcon, &baseInfo))
+        return nullptr;
+
+    BITMAP bm = {};
+    if (!baseInfo.hbmColor ||
+        !GetObject(baseInfo.hbmColor, sizeof(bm), &bm)) {
+        if (baseInfo.hbmColor) DeleteObject(baseInfo.hbmColor);
+        if (baseInfo.hbmMask)  DeleteObject(baseInfo.hbmMask);
+        return nullptr;
+    }
+
+    int cx = bm.bmWidth;
+    int cy = bm.bmHeight;
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
+
+    // BITMAPINFO for 32-bit bottom-up pixel access
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = cx;
+    bmi.bmiHeader.biHeight      = cy;   // positive = bottom-up
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    // Read the color bitmap as 32-bit BGRA pixels
+    std::vector<BYTE> px(cx * cy * 4, 0);
+    GetDIBits(hdcMem, baseInfo.hbmColor, 0, cy,
+              px.data(), &bmi, DIB_RGB_COLORS);
+
+    // If the icon has no per-pixel alpha, derive it from the mask
+    bool hasAlpha = false;
+    for (int i = 0; i < cx * cy; i++) {
+        if (px[i * 4 + 3] != 0) { hasAlpha = true; break; }
+    }
+    if (!hasAlpha) {
+        std::vector<BYTE> mask(cx * cy * 4, 0);
+        GetDIBits(hdcMem, baseInfo.hbmMask, 0, cy,
+                  mask.data(), &bmi, DIB_RGB_COLORS);
+        for (int i = 0; i < cx * cy; i++) {
+            // Mask: black (0) = opaque, white (255) = transparent
+            px[i * 4 + 3] = (mask[i * 4] < 128) ? 255 : 0;
+        }
+    }
+
+    // LED circle — bottom-right corner.
+    // Bottom-up bitmap: row 0 = bottom of image.
+    // Sized at ~45% of the icon for high visibility.
+    int   ledDiam = std::max(cx * 9 / 20, 7);
+    float cxLed   = cx - ledDiam / 2.0f;
+    float cyLed   = ledDiam / 2.0f;     // near row 0 = bottom
+    float r       = ledDiam / 2.0f;
+    float r2      = r * r;
+
+    BYTE rr = GetRValue(ledColor);
+    BYTE gg = GetGValue(ledColor);
+    BYTE bb = GetBValue(ledColor);
+
+    // Brighter version for the centre highlight
+    BYTE hrr = static_cast<BYTE>(std::min(255, rr + (255 - rr) * 2 / 3));
+    BYTE hgg = static_cast<BYTE>(std::min(255, gg + (255 - gg) * 2 / 3));
+    BYTE hbb = static_cast<BYTE>(std::min(255, bb + (255 - bb) * 2 / 3));
+
+    for (int y = 0; y < cy; y++) {
+        for (int x = 0; x < cx; x++) {
+            float dx = x + 0.5f - cxLed;
+            float dy = y + 0.5f - cyLed;
+            float d2 = dx * dx + dy * dy;
+            if (d2 <= r2) {
+                int idx = (y * cx + x) * 4;
+                float dist = sqrtf(d2);
+                float t = dist / r;           // 0 at centre, 1 at edge
+
+                if (t > 0.85f) {
+                    // Outer ring: darker border for definition
+                    float edgeT = (t - 0.85f) / 0.15f;   // 0→1 within ring
+                    BYTE darkR = static_cast<BYTE>(rr * (1.0f - edgeT * 0.7f));
+                    BYTE darkG = static_cast<BYTE>(gg * (1.0f - edgeT * 0.7f));
+                    BYTE darkB = static_cast<BYTE>(bb * (1.0f - edgeT * 0.7f));
+                    px[idx + 0] = darkB;
+                    px[idx + 1] = darkG;
+                    px[idx + 2] = darkR;
+                } else {
+                    // Inner glow: bright centre fading to base colour
+                    float glowT = t / 0.85f;  // 0 at centre, 1 at border start
+                    float glow  = (1.0f - glowT * glowT);  // quadratic falloff
+                    px[idx + 0] = static_cast<BYTE>(bb + (hbb - bb) * glow);
+                    px[idx + 1] = static_cast<BYTE>(gg + (hgg - gg) * glow);
+                    px[idx + 2] = static_cast<BYTE>(rr + (hrr - rr) * glow);
+                }
+                px[idx + 3] = 255;      // fully opaque
+            }
+        }
+    }
+
+    // Create a new DIB section with the modified pixels
+    void* newBits = nullptr;
+    HBITMAP hNewColor = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS,
+                                         &newBits, nullptr, 0);
+    if (hNewColor && newBits)
+        memcpy(newBits, px.data(), cx * cy * 4);
+
+    // All-black monochrome mask (alpha channel handles transparency)
+    HBITMAP hNewMask = CreateBitmap(cx, cy, 1, 1, nullptr);
+    {
+        HDC hdcM     = CreateCompatibleDC(hdcScreen);
+        HGDIOBJ old  = SelectObject(hdcM, hNewMask);
+        PatBlt(hdcM, 0, 0, cx, cy, BLACKNESS);
+        SelectObject(hdcM, old);
+        DeleteDC(hdcM);
+    }
+
+    ICONINFO newII  = {};
+    newII.fIcon     = TRUE;
+    newII.hbmColor  = hNewColor;
+    newII.hbmMask   = hNewMask;
+    HICON hResult   = CreateIconIndirect(&newII);
+
+    // Cleanup
+    DeleteObject(hNewColor);
+    DeleteObject(hNewMask);
+    DeleteObject(baseInfo.hbmColor);
+    DeleteObject(baseInfo.hbmMask);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen);
+
+    return hResult;
+}
+
+// Update the tray icon to reflect the current detection state.
+static void UpdateTrayIconState() {
+    HICON icon = Config::SEARCH.load() ? g_iconRed : g_iconGreen;
+    if (icon) g_trayIcon.UpdateIcon(icon);
+}
+
+// ============================================================
 // Helper: compute title hash for tab-aware window tracking
 // ============================================================
 // For other-process windows GetWindowTextW reads the cached
@@ -858,6 +1010,7 @@ static void HandleFocusChange(bool forceSearch = false) {
             savedLang.c_str());
 
         UpdateTrayTooltip();
+        UpdateTrayIconState();
     } else {
         // Same context, title may have changed but we're ignoring it.
         // On forced search (click), allow fresh detection.
@@ -874,6 +1027,7 @@ static void HandleFocusChange(bool forceSearch = false) {
             g_history.Clear();
             Config::SEARCH.store(true);
             g_lastCorrection.valid = false;
+            UpdateTrayIconState();
             Dbg("FORCE-SEARCH: click in same context, SEARCH=1");
         } else {
             // Just position change (e.g. arrow keys), keep state
@@ -1160,6 +1314,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
             g_lastCorrection.valid = false;
             UpdateTrayTooltip();
+            UpdateTrayIconState();
 
             return 1; // block the Esc key
         }
@@ -1276,9 +1431,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         Config::LastSetting = currentLayout;
                         g_cache.Clear();
                         g_history.Clear();
-                        Config::SEARCH.store(false);
+                        Config::SEARCH.store(true);
                         g_lastCorrection.valid = false;
                         UpdateTrayTooltip();
+                        UpdateTrayIconState();
                     }
                 }
             }
@@ -1585,6 +1741,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 g_cache.Clear();
                 g_history.Clear();
                 Config::SEARCH.store(false);
+                UpdateTrayIconState();
 
                 if (didCorrection) {
                     return 1; // Block the current keystroke
@@ -2011,7 +2168,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (!hIcon) {
         hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
-    g_trayIcon.Create(g_hwndHidden, hIcon);
+
+    // Create LED overlay icons for detection state indication
+    g_baseIcon  = hIcon;
+    g_iconRed   = CreateLedIcon(hIcon, RGB(220, 40, 40));    // undetected
+    g_iconGreen = CreateLedIcon(hIcon, RGB(40, 200, 40));    // detected
+
+    // SEARCH starts as false → green LED (idle / confirmed)
+    g_trayIcon.Create(g_hwndHidden, g_iconGreen ? g_iconGreen : hIcon);
     UpdateTrayTooltip();
 
     // Periodic cleanup of stale window entries (every 60 seconds)
@@ -2055,6 +2219,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (g_winEventHook) UnhookWinEvent(g_winEventHook);
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_mouseHook)    UnhookWindowsHookEx(g_mouseHook);
+    if (g_iconRed)   DestroyIcon(g_iconRed);
+    if (g_iconGreen) DestroyIcon(g_iconGreen);
     g_detector = nullptr;
     g_windows  = nullptr;
 

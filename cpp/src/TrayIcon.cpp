@@ -43,3 +43,10 @@ void TrayIcon::UpdateTooltip(const std::wstring& text) {
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
 
+void TrayIcon::UpdateIcon(HICON hIcon) {
+    if (!created_ || !hIcon) return;
+    nid_.uFlags = NIF_ICON;
+    nid_.hIcon = hIcon;
+    Shell_NotifyIconW(NIM_MODIFY, &nid_);
+}
+
