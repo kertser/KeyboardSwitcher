@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <set>
 #include <memory>
 
 // Result of a single language prediction with confidence scores
@@ -90,5 +91,6 @@ std::optional<DetectionResult> TypoResilientDetect(
     const std::vector<std::wstring>& textVariants,
     const std::string& currentLang,
     size_t numChars,
-    DetectionHistory& history);
+    DetectionHistory& history,
+    const std::set<std::string>& excludedLangs = {});
 

@@ -71,6 +71,7 @@ set(SOURCES
     src/InputCache.cpp
     src/WindowTracker.cpp
     src/TrayIcon.cpp
+    src/FeedbackLogger.cpp
 )
 
 set(HEADERS
@@ -79,6 +80,7 @@ set(HEADERS
     include/InputCache.h
     include/WindowTracker.h
     include/TrayIcon.h
+    include/FeedbackLogger.h
     resources/resource.h
 )
 

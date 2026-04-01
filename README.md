@@ -38,6 +38,7 @@ via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow/navigation keys, or manual layout switch |
+| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language, a fallback detection tries the next-best language so the full word is still corrected rather than left partially fixed |
 | **Clipboard preservation** | Clipboard content is saved before and restored immediately after each correction paste (while input is still blocked); a 300 ms fallback timer with stale-message guard handles edge cases, so your clipboard is never lost — even in multi-process apps like Chrome |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
@@ -80,6 +81,7 @@ KeyboardSwitcher/
 │   ├── keyboard.ico
 │   ├── include/
 │   │   ├── Config.h         # Version, adaptive curve parameters, language maps
+│   │   ├── FeedbackLogger.h # User exception list & learned correction overrides
 │   │   ├── Languages.h
 │   │   ├── InputCache.h
 │   │   ├── WindowTracker.h
@@ -87,6 +89,7 @@ KeyboardSwitcher/
 │   ├── src/
 │   │   ├── main.cpp
 │   │   ├── Config.cpp
+│   │   ├── FeedbackLogger.cpp
 │   │   ├── Languages.cpp
 │   │   ├── InputCache.cpp
 │   │   ├── WindowTracker.cpp

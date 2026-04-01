@@ -9,6 +9,7 @@
 
 // nlohmann/json single-header
 #include <nlohmann/json.hpp>
+#include <set>
 
 // ============================================================
 // Keyboard layout strings
@@ -336,8 +337,11 @@ std::optional<DetectionResult> TypoResilientDetect(
     const std::vector<std::wstring>& textVariants,
     const std::string& currentLang,
     size_t numChars,
-    DetectionHistory& history)
+    DetectionHistory& history,
+    const std::set<std::string>& excludedLangs)
 {
+    const bool isFallback = !excludedLangs.empty();
+
     // --- Standard best-variant detection (same as before) ---
     std::string bestLang;
     float       bestConf = 0.0f;
@@ -346,6 +350,8 @@ std::optional<DetectionResult> TypoResilientDetect(
     for (const auto& variant : textVariants) {
         auto result = detector.PredictLanguageWithConfidence(variant);
         if (result.has_value() && result->confidence > bestConf) {
+            // Skip languages the caller has excluded (user-rejected)
+            if (excludedLangs.count(result->language)) continue;
             bestConf = result->confidence;
             bestLang = result->language;
             bestVariant = variant;
@@ -353,7 +359,7 @@ std::optional<DetectionResult> TypoResilientDetect(
     }
 
     if (bestLang.empty()) {
-        history.Update("", 0.0f);
+        if (!isFallback) history.Update("", 0.0f);
         return std::nullopt;
     }
 
@@ -364,7 +370,7 @@ std::optional<DetectionResult> TypoResilientDetect(
     // Per-pair min-chars check: the pair may require more characters
     // than the global minimum that was used as the early-out in the caller.
     if (static_cast<int>(numChars) < params.EarlyDetectionMinChars) {
-        history.Update(bestLang, bestConf);
+        if (!isFallback) history.Update(bestLang, bestConf);
         return std::nullopt;
     }
 
@@ -390,17 +396,20 @@ std::optional<DetectionResult> TypoResilientDetect(
         }
     }
 
-    // Update the history with whatever language won this round.
-    history.Update(bestLang, bestConf);
+    // --- History & consecutive-agreement gate ---
+    // When this is a fallback call (excludedLangs non-empty), skip
+    // history update and the agreement gate — the primary detection
+    // already proved consistency, and the user explicitly rejected
+    // the top choice.  We only require the confidence threshold.
+    if (!isFallback) {
+        // Update the history with whatever language won this round.
+        history.Update(bestLang, bestConf);
 
-    // --- Tier 1: Consecutive-agreement gate ---
-    // Even if confidence is high, require N consecutive keystrokes to
-    // agree before committing.  This is free (no extra model calls) and
-    // prevents a single-typo from triggering a spurious switch.
-    if (Config::EnableTypoResilience) {
-        if (!history.IsConsistent(bestLang, params.ConsecutiveAgreementCount)) {
-            // Not enough agreement yet — keep accumulating.
-            return std::nullopt;
+        // --- Tier 1: Consecutive-agreement gate ---
+        if (Config::EnableTypoResilience) {
+            if (!history.IsConsistent(bestLang, params.ConsecutiveAgreementCount)) {
+                return std::nullopt;
+            }
         }
     }
 

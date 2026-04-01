@@ -32,6 +32,7 @@
 #include "InputCache.h"
 #include "WindowTracker.h"
 #include "TrayIcon.h"
+#include "FeedbackLogger.h"
 #include "../resources/resource.h"
 
 // ============================================================
@@ -585,6 +586,8 @@ struct LastCorrectionInfo {
     std::wstring correctedText;     // what was pasted as replacement
     std::string  originalLang;      // keyboard layout before correction
     std::string  correctedLang;     // keyboard layout after correction
+    float        confidence = 0.0f; // model softmax score at detection time
+    int          numChars   = 0;    // cache size when detection fired
     HWND         hwnd = nullptr;    // window where correction happened
     size_t       ctxHash = 0;       // context hash
     std::vector<wchar_t> postChars; // chars typed after correction (for buffered undo)
@@ -592,6 +595,11 @@ struct LastCorrectionInfo {
 };
 static LastCorrectionInfo g_lastCorrection;
 static constexpr size_t MAX_UNDO_POST_CHARS = 100;
+
+// Pending rejection state for Pattern B feedback
+// (backspace past corrected text → manual language switch = rejected correction)
+static Feedback::PendingRejection g_pendingRejection;
+
 
 // ============================================================
 // Helper: get the executable directory
@@ -951,10 +959,12 @@ static void HandleFocusChange(bool forceSearch = false) {
     if (contextChanged) {
         // Invalidate undo — user moved to a different context
         g_lastCorrection.valid = false;
+        g_pendingRejection.active = false;  // context change invalidates
 
         // Expire any post-correction grace period
         g_lastCorrectionTick = 0;
         g_lastCorrectionLang.clear();
+
 
         size_t prevCtxHash = g_lastContextHash;
         HWND prevHwnd = g_lastForegroundHwnd;
@@ -1312,7 +1322,35 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             g_cache.Clear();
             g_history.Clear();
 
+            // ── Feedback: Pattern A — Esc-undo ──
+            // The correction was wrong. Log it and add the corrected text
+            // to the exception list so it (and its prefixes) won't fire again.
+            {
+                Feedback::Entry fb;
+                fb.type          = "esc_undo";
+                fb.originalText  = g_lastCorrection.originalText;
+                fb.correctedText = g_lastCorrection.correctedText;
+                fb.fromLang      = g_lastCorrection.originalLang;
+                fb.toLang        = g_lastCorrection.correctedLang;
+                fb.actualLang    = g_lastCorrection.originalLang;
+                fb.confidence    = g_lastCorrection.confidence;
+                fb.numChars      = g_lastCorrection.numChars;
+                Feedback::LogEvent(fb);
+                Feedback::AddException(
+                    g_lastCorrection.correctedLang,
+                    g_lastCorrection.correctedText);
+                Feedback::AddOverride(
+                    g_lastCorrection.correctedLang,
+                    g_lastCorrection.correctedText,
+                    g_lastCorrection.originalLang);
+                Dbg("FEEDBACK: esc_undo %s->%s conf=%.3f",
+                    g_lastCorrection.originalLang.c_str(),
+                    g_lastCorrection.correctedLang.c_str(),
+                    g_lastCorrection.confidence);
+            }
+
             g_lastCorrection.valid = false;
+            g_pendingRejection.active = false;
             UpdateTrayTooltip();
             UpdateTrayIconState();
 
@@ -1412,6 +1450,83 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             windowLang.c_str(), currentLayout.c_str(),
                             g_lastForegroundHwnd, g_lastContextHash);
 
+                        // ── Feedback: detect rejected correction ──
+                        // Two complementary signals:
+                        //
+                        // 1) Direct switch-away: correction recently fired,
+                        //    and the user just switched FROM the corrected
+                        //    language to something else.  This is the most
+                        //    common rejection pattern (erase + switch, or
+                        //    just switch then erase/retype).
+                        //
+                        // 2) Pending rejection (Pattern B): backspace erased
+                        //    past the correction boundary, then manual switch
+                        //    follows within a shorter window.
+                        bool feedbackLogged = false;
+                        DWORD now = GetTickCount();
+
+                        // Signal 1: switch away from corrected language
+                        if (!feedbackLogged &&
+                            g_lastCorrectionTick != 0 &&
+                            (now - g_lastCorrectionTick) < Feedback::SWITCH_AWAY_WINDOW_MS &&
+                            windowLang == g_lastCorrectionLang &&
+                            g_lastCorrection.correctedLang == g_lastCorrectionLang) {
+                            Feedback::Entry fb;
+                            fb.type          = "manual_override";
+                            fb.originalText  = g_lastCorrection.originalText;
+                            fb.correctedText = g_lastCorrection.correctedText;
+                            fb.fromLang      = g_lastCorrection.originalLang;
+                            fb.toLang        = g_lastCorrection.correctedLang;
+                            fb.actualLang    = currentLayout;
+                            fb.confidence    = g_lastCorrection.confidence;
+                            fb.numChars      = g_lastCorrection.numChars;
+                            Feedback::LogEvent(fb);
+                            Feedback::AddException(
+                                g_lastCorrection.correctedLang,
+                                g_lastCorrection.correctedText);
+                            Feedback::AddOverride(
+                                g_lastCorrection.correctedLang,
+                                g_lastCorrection.correctedText,
+                                g_lastCorrection.originalLang);
+                            Dbg("FEEDBACK: switch_away %s→%s actual=%s conf=%.3f elapsed=%lums",
+                                g_lastCorrection.originalLang.c_str(),
+                                g_lastCorrection.correctedLang.c_str(),
+                                currentLayout.c_str(),
+                                g_lastCorrection.confidence,
+                                (unsigned long)(now - g_lastCorrectionTick));
+                            feedbackLogged = true;
+                        }
+
+                        // Signal 2: pending rejection from backspace-past-boundary
+                        if (!feedbackLogged &&
+                            g_pendingRejection.active &&
+                            (now - g_pendingRejection.tick) < Feedback::REJECTION_WINDOW_MS) {
+                            Feedback::Entry fb;
+                            fb.type          = "manual_override";
+                            fb.originalText  = g_pendingRejection.originalText;
+                            fb.correctedText = g_pendingRejection.correctedText;
+                            fb.fromLang      = g_pendingRejection.fromLang;
+                            fb.toLang        = g_pendingRejection.toLang;
+                            fb.actualLang    = currentLayout;
+                            fb.confidence    = g_pendingRejection.confidence;
+                            fb.numChars      = g_pendingRejection.numChars;
+                            Feedback::LogEvent(fb);
+                            Feedback::AddException(
+                                g_pendingRejection.toLang,
+                                g_pendingRejection.correctedText);
+                            Feedback::AddOverride(
+                                g_pendingRejection.toLang,
+                                g_pendingRejection.correctedText,
+                                g_pendingRejection.fromLang);
+                            Dbg("FEEDBACK: pending_rejection %s→%s actual=%s conf=%.3f",
+                                g_pendingRejection.fromLang.c_str(),
+                                g_pendingRejection.toLang.c_str(),
+                                currentLayout.c_str(),
+                                g_pendingRejection.confidence);
+                            feedbackLogged = true;
+                        }
+                        g_pendingRejection.active = false;
+
                         // Expire any lingering grace period
                         g_lastCorrectionTick = 0;
                         g_lastCorrectionLang.clear();
@@ -1481,8 +1596,22 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         if (g_lastCorrection.valid) {
             if (!g_lastCorrection.postChars.empty())
                 g_lastCorrection.postChars.pop_back();
-            else
+            else {
+                // User erased past the corrected text boundary.
+                // Save metadata for Pattern B feedback detection.
+                g_pendingRejection.originalText  = g_lastCorrection.originalText;
+                g_pendingRejection.correctedText = g_lastCorrection.correctedText;
+                g_pendingRejection.fromLang      = g_lastCorrection.originalLang;
+                g_pendingRejection.toLang        = g_lastCorrection.correctedLang;
+                g_pendingRejection.confidence    = g_lastCorrection.confidence;
+                g_pendingRejection.numChars      = g_lastCorrection.numChars;
+                g_pendingRejection.tick           = GetTickCount();
+                g_pendingRejection.active         = true;
+                Dbg("PENDING-REJECTION: %s->%s (backspace past boundary)",
+                    g_lastCorrection.originalLang.c_str(),
+                    g_lastCorrection.correctedLang.c_str());
                 g_lastCorrection.valid = false;
+            }
         }
     } else if (vk == VK_SPACE) {
         g_cache.PushChar(L' ', false);
@@ -1574,14 +1703,30 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 *g_detector, textVariants, currentLangId, cacheSize, g_history);
 
             if (detection.has_value()) {
-                const std::string& bestLang = detection->language;
+                std::string bestLang = detection->language;  // copy — may be overridden
                 bool didCorrection = false;
 
                 Dbg("DETECTION: currentLang=%s bestLang=%s conf=%.3f cacheText=%s",
                     currentLangId.c_str(), bestLang.c_str(), detection->confidence,
                     ws2s(text).c_str());
 
+                // Learned correction override: if the model says the
+                // text matches the current keyboard (no correction
+                // needed), check if the user previously rejected the
+                // reverse correction for this exact text.  If so,
+                // override the model and apply the learned direction.
+                if (currentLangId == bestLang) {
+                    std::string overrideLang = Feedback::GetOverride(currentLangId, text);
+                    if (!overrideLang.empty()) {
+                        Dbg("OVERRIDE: learned %s→%s for %s",
+                            currentLangId.c_str(), overrideLang.c_str(),
+                            ws2s(text).c_str());
+                        bestLang = overrideLang;
+                    }
+                }
+
                 if (currentLangId != bestLang) {
+
                     // Guard: reject detection if converting from the
                     // current layout to the detected layout would lose
                     // characters (leaked chars).  The variant filter
@@ -1618,6 +1763,57 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                     Dbg("CORRECT: cacheLen=%zu cached=%s corrected=%s",
                         cacheLen, ws2s(cachedText).c_str(), ws2s(correctedText).c_str());
+
+                    // Exception guard: if this exact corrected text was
+                    // previously rejected by the user, skip the correction.
+                    // Instead of clearing the cache (which would lose the
+                    // buffered chars and cause partial corrections), try a
+                    // fallback detection with the rejected language excluded.
+                    if (Feedback::IsException(bestLang, correctedText)) {
+                        Dbg("REJECT: correctedText is in user exception list for %s",
+                            bestLang.c_str());
+
+                        // Try fallback: re-detect excluding the rejected language.
+                        // This lets a second-best language (e.g. Russian when
+                        // Hebrew was rejected) correct the full cached word.
+                        bool fallbackApplied = false;
+                        std::set<std::string> excluded = { bestLang };
+                        auto fallback = TypoResilientDetect(
+                            *g_detector, textVariants, currentLangId, cacheSize,
+                            g_history, excluded);
+
+                        if (fallback.has_value() &&
+                            fallback->language != currentLangId &&
+                            !HasLeakedLayoutChars(
+                                text,
+                                Layouts::GetLayoutForLanguage(currentLangId),
+                                Layouts::GetLayoutForLanguage(fallback->language)))
+                        {
+                            std::wstring fbCorrected = ConvertTextBidirectional(
+                                cachedText,
+                                Layouts::GetLayoutForLanguage(currentLangId),
+                                Layouts::GetLayoutForLanguage(fallback->language));
+
+                            if (!Feedback::IsException(fallback->language, fbCorrected)) {
+                                Dbg("EXCEPTION-FALLBACK: %s->%s conf=%.3f corrected=%s",
+                                    currentLangId.c_str(), fallback->language.c_str(),
+                                    fallback->confidence,
+                                    ws2s(fbCorrected).c_str());
+                                bestLang      = fallback->language;
+                                correctedText = fbCorrected;
+                                detection     = fallback;
+                                fallbackApplied = true;
+                            }
+                        }
+
+                        if (!fallbackApplied) {
+                            // No viable alternative — keep cache intact so the
+                            // next keystroke re-evaluates the full word.  Clear
+                            // only history to reset the agreement gate.
+                            g_history.Clear();
+                            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+                        }
+                    }
 
                     // Preserve first-letter capitalization.
                     // Two-tier check:
@@ -1704,10 +1900,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     g_lastCorrection.correctedText = correctedText;
                     g_lastCorrection.originalLang  = currentLangId;
                     g_lastCorrection.correctedLang = bestLang;
+                    g_lastCorrection.confidence    = detection->confidence;
+                    g_lastCorrection.numChars      = static_cast<int>(cacheLen);
                     g_lastCorrection.hwnd          = g_lastForegroundHwnd;
                     g_lastCorrection.ctxHash       = g_lastContextHash;
                     g_lastCorrection.postChars.clear();
                     g_lastCorrection.valid         = true;
+                    g_pendingRejection.active      = false; // new correction supersedes
 
                     UpdateTrayTooltip();
                 }
@@ -2019,7 +2218,15 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 AppendMenuW(hMenu,
                     MF_STRING | (g_debugLogEnabled ? MF_CHECKED : MF_UNCHECKED),
                     ID_TRAY_DEBUG_LOG, L"Debug Log");
+                AppendMenuW(hMenu,
+                    MF_STRING | (Feedback::LoggingEnabled.load() ? MF_CHECKED : MF_UNCHECKED),
+                    ID_TRAY_COLLECT_FEEDBACK, L"Collect Feedback");
 
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_FEEDBACK,
+                    L"Open Feedback Folder\x2026");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_RESET_LEARNING,
+                    L"Reset Learned Exceptions");
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_CHECK_UPDATE, L"Check for Updates\x2026");
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"About");
@@ -2064,6 +2271,24 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_CHECK_UPDATE:
             CheckForUpdatesAsync(true);
+            break;
+        case ID_TRAY_COLLECT_FEEDBACK:
+            Feedback::SetLoggingEnabled(!Feedback::LoggingEnabled.load());
+            break;
+        case ID_TRAY_OPEN_FEEDBACK: {
+            std::wstring dir = Feedback::GetDataDir();
+            ShellExecuteW(nullptr, L"open", dir.c_str(),
+                          nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        case ID_TRAY_RESET_LEARNING:
+            if (MessageBoxW(nullptr,
+                    L"Reset all learned confidence thresholds and delete "
+                    L"the feedback log?\n\nThis cannot be undone.",
+                    L"Keyboard Switcher",
+                    MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                Feedback::ResetAll();
+            }
             break;
         case ID_TRAY_EXIT:
             g_trayIcon.Remove();
@@ -2137,6 +2362,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_windows = windowTracker.get();
     std::string initialLang = GetCurrentKeyboardLayout();
     Config::LastSetting = initialLang;
+
+    // Initialize feedback logger (loads persisted thresholds & preferences)
+    Feedback::Init();
 
     // Seed focus-tracking globals so the first keystroke doesn't
     // trigger a spurious HandleFocusChange.
