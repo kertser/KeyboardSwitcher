@@ -1406,10 +1406,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // --- Track manual layout changes ---
     // If the user manually switched the layout (e.g. Alt+Shift),
-    // update the saved language and disable detection.  The user
-    // made a deliberate choice — respect it.  Detection will
-    // re-enable on the next context change (window/tab switch,
-    // click in the same field, etc.).
+    // update the saved language and DISABLE detection (SEARCH=false).
+    // A manual switch is an ultimate signal that the user chose their
+    // language — respect it unconditionally.  Detection re-enables on
+    // the next context change (window/tab switch, click, etc.).
     {
         if (g_windows && g_lastForegroundHwnd) {
             std::string windowLang =
@@ -1546,7 +1546,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         Config::LastSetting = currentLayout;
                         g_cache.Clear();
                         g_history.Clear();
-                        Config::SEARCH.store(true);
+                        Config::SEARCH.store(false);
                         g_lastCorrection.valid = false;
                         UpdateTrayTooltip();
                         UpdateTrayIconState();
