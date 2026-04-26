@@ -125,6 +125,7 @@ Key files:
 | `Languages.py` | ONNX inference & keyboard-layout conversion utilities |
 | `Languages_torch.py` | PyTorch model class (used during training & export) |
 | `tune_confidence.py` | Offline grid-search for adaptive confidence-curve parameters |
+| `evaluate_transitions.py` | Offline validation of all directed language transitions (en↔ru↔he) on vocabulary dictionaries |
 | `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
 ## C++ Version
