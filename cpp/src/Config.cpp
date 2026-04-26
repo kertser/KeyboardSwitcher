@@ -56,12 +56,12 @@ namespace Config {
         { {"en", "ru"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
         { {"ru", "en"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
 
-        // ── English ↔ Hebrew ─── (slightly stricter at short lengths)
-        { {"en", "he"}, { 3, 10, 0.98f, 0.60f, 2, 0.85f } },
+        // ── English ↔ Hebrew ─── (stricter for short 2–3 char words)
+        { {"en", "he"}, { 4, 12, 0.99f, 0.66f, 2, 0.88f } },
         { {"he", "en"}, { 4, 10, 0.98f, 0.60f, 2, 0.85f } },
 
         // ── Russian ↔ Hebrew ─── (both non-Latin; need more context)
-        { {"ru", "he"}, { 3, 10, 0.98f, 0.60f, 2, 0.80f } },
+        { {"ru", "he"}, { 4, 12, 0.99f, 0.66f, 2, 0.88f } },
         { {"he", "ru"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
     };
 
@@ -120,4 +120,3 @@ namespace Config {
     }
 
 } // namespace Config
-
