@@ -1642,7 +1642,46 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         std::string currentLangId = GetCurrentKeyboardLayout();
         std::wstring text = g_cache.GetText();
 
-        // Edge-case filter: skip detection for URLs, paths, mostly non-alpha
+        // ── Count alphabetic characters ──────────────────────────────
+        // Non-alpha symbols (e.g. //, ;, commas, brackets) must NOT count
+        // toward the minimum character requirement or lower the confidence
+        // threshold.  Only iswalpha characters carry actual language signal.
+        //
+        // Important: Hebrew/Russian letters entered via their keyboard layouts
+        // are all iswalpha==true, so they are always kept.  For example, the
+        // physical comma key on Hebrew keyboard produces 'ת' (iswalpha=true)
+        // and the period key produces 'ץ' (iswalpha=true).  Only ASCII
+        // punctuation that entered the cache from an English keyboard at the
+        // same physical position will have iswalpha==false and be excluded.
+        size_t alphaCount = 0;
+        for (wchar_t c : text) {
+            if (iswalpha(c)) ++alphaCount;
+        }
+
+        // ── Build detectionText: alpha chars + spaces only, trimmed ──
+        // Used for variant generation and model input so that leading/trailing
+        // symbols (like "// text" → "text") don't bias or confuse the model.
+        // The full cache text (text / cachedText) is still used for correction
+        // so the backspace count and conversion are always accurate.
+        std::wstring detectionText;
+        {
+            detectionText.reserve(text.size());
+            for (wchar_t c : text) {
+                if (iswalpha(c) || c == L' ')
+                    detectionText += c;
+            }
+            // Trim leading/trailing spaces
+            size_t s = detectionText.find_first_not_of(L' ');
+            if (s == std::wstring::npos) {
+                detectionText.clear();
+            } else {
+                size_t e = detectionText.find_last_not_of(L' ');
+                detectionText = detectionText.substr(s, e - s + 1);
+            }
+        }
+
+        // Edge-case filter: skip detection for URLs, paths, or insufficient
+        // alphabetic content.
         bool shouldSkip = false;
         if (text.find(L"://") != std::wstring::npos ||
             text.find(L"www.") != std::wstring::npos ||
@@ -1652,18 +1691,22 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         if (text.size() > 2 && text[1] == L':' && (text[2] == L'\\' || text[2] == L'/')) {
             shouldSkip = true;
         }
-        {
-            size_t alphaCount = 0;
-            for (wchar_t c : text) {
-                if (iswalpha(c)) ++alphaCount;
-            }
-            if (alphaCount < text.size() / 2) shouldSkip = true;
+        // Require a minimum number of actual letter characters.
+        // This replaces the old ">50% alpha ratio" check — we now insist on
+        // at least EarlyDetectionMinChars real letter characters so that
+        // entries like "// x" or "; ab" (lots of symbols, few letters) are
+        // ignored early without entering the expensive detection path.
+        if (alphaCount < static_cast<size_t>(Config::EarlyDetectionMinChars) ||
+            detectionText.size() < static_cast<size_t>(Config::EarlyDetectionMinChars)) {
+            shouldSkip = true;
         }
 
         if (!shouldSkip) {
             // Generate layout conversion variants, skipping those where
             // source-layout characters can't map to the target layout
             // (e.g. shifted English chars have no Hebrew equivalent).
+            // Variants are generated from detectionText (alpha+spaces only)
+            // so that punctuation symbols don't produce spurious conversions.
             struct ConvPair {
                 const std::wstring& from;
                 const std::wstring& to;
@@ -1679,11 +1722,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
             std::vector<std::wstring> textVariants;
             for (const auto& cp : convPairs) {
-                if (HasLeakedLayoutChars(text, cp.from, cp.to)) {
+                if (HasLeakedLayoutChars(detectionText, cp.from, cp.to)) {
                     continue;   // skip lossy conversion
                 }
                 textVariants.push_back(
-                    ConvertTextBidirectional(text, cp.from, cp.to));
+                    ConvertTextBidirectional(detectionText, cp.from, cp.to));
             }
 
             // Deduplicate (preserving first occurrence order)
@@ -1699,16 +1742,18 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
             // Typo-resilient detection: consecutive agreement + drop-one boosting
             // Uses per-language-pair parameters for confidence thresholds.
+            // alphaCount (not cacheSize) is used as numChars so that non-alpha
+            // symbols don't artificially lower the required confidence.
             auto detection = TypoResilientDetect(
-                *g_detector, textVariants, currentLangId, cacheSize, g_history);
+                *g_detector, textVariants, currentLangId, alphaCount, g_history);
 
             if (detection.has_value()) {
                 std::string bestLang = detection->language;  // copy — may be overridden
                 bool didCorrection = false;
 
-                Dbg("DETECTION: currentLang=%s bestLang=%s conf=%.3f cacheText=%s",
+                Dbg("DETECTION: currentLang=%s bestLang=%s conf=%.3f cacheText=%s detText=%s alpha=%zu",
                     currentLangId.c_str(), bestLang.c_str(), detection->confidence,
-                    ws2s(text).c_str());
+                    ws2s(text).c_str(), ws2s(detectionText).c_str(), alphaCount);
 
                 // Learned correction override: if the model says the
                 // text matches the current keyboard (no correction
@@ -1779,7 +1824,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         bool fallbackApplied = false;
                         std::set<std::string> excluded = { bestLang };
                         auto fallback = TypoResilientDetect(
-                            *g_detector, textVariants, currentLangId, cacheSize,
+                            *g_detector, textVariants, currentLangId, alphaCount,
                             g_history, excluded);
 
                         if (fallback.has_value() &&

@@ -25,11 +25,17 @@ namespace Config {
     }
 
     // ── Global default parameters ──────────────────────────────────
+    // Tuned with tune_confidence.py (sample=200, --phrases, consecutive=2)
+    // on a test set that includes short Hebrew phrases (2-char first word).
+    // Key changes vs previous: FullConfidenceChars 10→15, ConfAtMax 0.55→0.70.
+    // Raising the floor reduces false positives for en↔ru without hurting
+    // detection speed on Hebrew (model confidence on Hebrew is typically >0.97
+    // even at 3 chars, well above the new 0.70 floor).
     SwitchingParams DefaultParams = {
         /* EarlyDetectionMinChars  */ 3,
-        /* FullConfidenceChars     */ 10,
-        /* ConfidenceAtMinChars    */ 0.97f,
-        /* ConfidenceAtMaxChars    */ 0.55f,
+        /* FullConfidenceChars     */ 15,
+        /* ConfidenceAtMinChars    */ 0.99f,
+        /* ConfidenceAtMaxChars    */ 0.70f,
         /* ConsecutiveAgreementCount */ 2,
         /* BorderlineZoneFactor    */ 0.85f,
     };
@@ -37,32 +43,42 @@ namespace Config {
     // ── Per-pair overrides ─────────────────────────────────────────
     // Different language pairs have different detection characteristics:
     //
-    //  en↔ru : Distinct scripts (Latin vs Cyrillic). The model is very
-    //          confident even on short input → standard defaults work.
+    //  en↔ru : Distinct scripts (Latin vs Cyrillic). Updated to the tuned
+    //          default values (FullConf=15, floor=0.70).
     //
-    //  en↔he : Distinct scripts (Latin vs Hebrew). Hebrew has no upper-
-    //          case, so typed-on-English is always lowercase — slightly
-    //          easier to confuse with short English. Require a bit more
-    //          confidence at short lengths.
+    //  x→he  : Hebrew Unicode (U+05D0–U+05EA) is completely distinct from
+    //          both Latin and Cyrillic, so the model is highly confident even
+    //          at 3 characters.  EarlyDetectionMinChars=3 enables correction of
+    //          common short Hebrew words (כן, לא, גם, כי, אם, אך…) as well as
+    //          short phrases whose first word is only 2 chars (מה שלומך etc.).
+    //          Note: numChars is alphaCount (not raw cache size), so spaces and
+    //          punctuation no longer inflate the count or lower confidence.
+    //          The floor is raised to 0.72 (above the tuned 0.70 default) since
+    //          Hebrew-script detection is very reliable and we want to prevent
+    //          the rare case where a Cyrillic/Latin partial mis-classifies.
     //
-    //  ru↔he : Both non-Latin. Physical key positions overlap less, and
-    //          the model may need more context. Slightly higher min-chars
-    //          and confidence give more room to discriminate.
+    //  he→x  : Same reasoning in reverse — min=3 with a 0.70 floor.
     //
     // Pairs not listed here automatically fall back to DefaultParams.
-    // To keep all pairs at defaults, simply leave PairOverrides empty.
     std::map<LangPair, SwitchingParams> PairOverrides = {
-        // ── English ↔ Russian ─── (standard — same as default)
-        { {"en", "ru"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
-        { {"ru", "en"}, { 3, 10, 0.97f, 0.55f, 2, 0.85f } },
+        // ── English ↔ Russian ─── (tuned defaults)
+        { {"en", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
+        { {"ru", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
 
-        // ── English ↔ Hebrew ─── (stricter for short 2–3 char words)
-        { {"en", "he"}, { 4, 12, 0.99f, 0.66f, 2, 0.88f } },
-        { {"he", "en"}, { 4, 10, 0.98f, 0.60f, 2, 0.85f } },
+        // ── English ↔ Hebrew ───
+        // en→he: user has English active but is typing Hebrew.
+        //   MinChars=3 catches short Hebrew words and short+long phrases.
+        //   ConfAtMin=0.99 keeps early FP very low; ConfAtMax=0.72 is the
+        //   relaxed floor (slightly above global 0.70 for Hebrew robustness).
+        { {"en", "he"}, { 3, 15, 0.99f, 0.72f, 2, 0.88f } },
+        // he→en: user has Hebrew active but is typing English.
+        { {"he", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
 
-        // ── Russian ↔ Hebrew ─── (both non-Latin; need more context)
-        { {"ru", "he"}, { 4, 12, 0.99f, 0.66f, 2, 0.88f } },
-        { {"he", "ru"}, { 4, 10, 0.98f, 0.60f, 2, 0.80f } },
+        // ── Russian ↔ Hebrew ───
+        // ru→he: Cyrillic and Hebrew are fully disjoint → same confidence as en→he.
+        { {"ru", "he"}, { 3, 15, 0.99f, 0.72f, 2, 0.88f } },
+        // he→ru: user has Hebrew active but is typing Russian.
+        { {"he", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.80f } },
     };
 
     const SwitchingParams& GetParamsForPair(const std::string& fromLang,
