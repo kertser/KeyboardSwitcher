@@ -76,6 +76,38 @@ namespace Config {
     // Master toggle for typo resilience (applies to all pairs)
     extern bool  EnableTypoResilience;
 
+    // ================================================================
+    // New parameters (Iteration 1)
+    // ================================================================
+
+    // Minimum number of dictionary-known characters required before
+    // running ONNX inference.  Text with fewer known chars is skipped
+    // with reason skip_low_known_chars.  Default: 2.
+    extern int MinKnownCharsForInference;
+
+    // When true, auto-switching from English to Hebrew/Russian is blocked
+    // inside file-open/save dialogs (#32770 + DirectUIHWND/ComboBoxEx32).
+    // Manual layout switches by the user are never blocked.  Default: true.
+    extern bool DisableAutoSwitchFromEnglishInFileDialogs;
+
+    // ================================================================
+    // Skip-reason counters — diagnostic / telemetry
+    // ================================================================
+    // Each guard branch increments the corresponding counter so that
+    // the debug log can report aggregate statistics.
+    struct SkipCounters {
+        std::atomic<uint32_t> skipEmptyAfterTokenize{0};
+        std::atomic<uint32_t> skipLowKnownChars{0};
+        std::atomic<uint32_t> skipLowAlpha{0};
+        std::atomic<uint32_t> skipUrlOrPath{0};
+        std::atomic<uint32_t> skipFileDialogEnProtection{0};
+        std::atomic<uint32_t> correctionsApplied{0};
+
+        void Reset() noexcept;
+        std::string Summary() const;
+    };
+    extern SkipCounters Guards;
+
     // Language codes for ActivateKeyboardLayout / PostMessage
     extern const std::unordered_map<std::string, HKL> LANGUAGE_CODES;
 
@@ -89,4 +121,3 @@ namespace Config {
     HKL GetHKLFromLanguage(const std::string& lang);
 
 } // namespace Config
-

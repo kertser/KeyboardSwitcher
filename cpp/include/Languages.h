@@ -77,6 +77,25 @@ std::wstring ConvertTextBidirectional(const std::wstring& text,
     const std::wstring& fromLayout, const std::wstring& toLayout);
 
 // ============================================================
+// Hebrew final-form normalisation (for model input only)
+// ============================================================
+// Replaces sofit (word-final) forms with their base equivalents:
+//   ך→כ  ם→מ  ן→נ  ף→פ  ץ→צ
+// Call this on text before passing to the model to improve detection
+// confidence on words that end with sofit letters.  Never apply to
+// text that the user sees — only to detection variant strings.
+std::wstring NormalizeHebrewFinals(const std::wstring& text);
+
+// ============================================================
+// Cached conversion maps (Iteration 4 — perf)
+// ============================================================
+// Returns a reference to a statically cached conversion map for the
+// six fixed layout pairs.  Falls back to a freshly created map for
+// any non-standard pair.
+const std::unordered_map<wchar_t, wchar_t>& GetCachedConversionMap(
+    const std::wstring& sourceLayout, const std::wstring& targetLayout);
+
+// ============================================================
 // Typo-resilient detection wrapper
 // ============================================================
 // Runs detection across all layout variants, applies:

@@ -835,6 +835,58 @@ static size_t GetWindowTitleHash(HWND hwnd) {
 }
 
 // ============================================================
+// File-dialog context detection (Iteration 3 — C)
+// ============================================================
+// Heuristically decides whether the currently active window is a
+// Windows common file dialog (Open / Save As / Browse…).
+//
+// Strategy:
+//   • Top-level class #32770 (generic dialog) is necessary.
+//   • Presence of DirectUIHWND child → Vista+ common file dialog (Definite).
+//   • Presence of ComboBoxEx32 without DirectUIHWND → older/custom file
+//     dialogs such as MFC SaveAs or Office Browse (Probable).
+//   • Plain #32770 with neither → Probable (conservative).
+//
+// Only used to implement the en→he/ru auto-switch block; the return value
+// is never shown to the user.
+// ============================================================
+enum class FileDialogConfidence { None, Probable, Definite };
+
+struct FileDialogChildInfo {
+    bool hasDirectUI = false;
+    bool hasComboEx  = false;
+};
+
+static BOOL CALLBACK FileDialogChildEnumCallback(HWND child, LPARAM lp) {
+    auto* info = reinterpret_cast<FileDialogChildInfo*>(lp);
+    wchar_t cls[64] = {};
+    GetClassNameW(child, cls, 64);
+    if (wcscmp(cls, L"DirectUIHWND") == 0) info->hasDirectUI = true;
+    if (wcscmp(cls, L"ComboBoxEx32") == 0) info->hasComboEx  = true;
+    return TRUE; // continue enumeration
+}
+
+static FileDialogConfidence IsFileDialogContext(HWND hwnd) {
+    if (!hwnd) return FileDialogConfidence::None;
+
+    wchar_t className[256] = {};
+    GetClassNameW(hwnd, className, 256);
+
+    if (wcscmp(className, L"#32770") == 0) {
+        FileDialogChildInfo info;
+        EnumChildWindows(hwnd, FileDialogChildEnumCallback,
+                         reinterpret_cast<LPARAM>(&info));
+        if (info.hasDirectUI) return FileDialogConfidence::Definite;
+        if (info.hasComboEx)  return FileDialogConfidence::Probable;
+        // Plain #32770 — treat conservatively as Probable to avoid
+        // false negatives in older-style file dialogs.
+        return FileDialogConfidence::Probable;
+    }
+
+    return FileDialogConfidence::None;
+}
+
+// ============================================================
 // Helper: get the focused child control inside a top-level window
 // ============================================================
 // Uses GetGUIThreadInfo() which reads kernel state — no IPC,
@@ -1687,18 +1739,27 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             text.find(L"www.") != std::wstring::npos ||
             text.find(L"http") != std::wstring::npos) {
             shouldSkip = true;
+            ++Config::Guards.skipUrlOrPath;
+            Dbg("SKIP: skip_url_or_path (url/http pattern in cache)");
         }
-        if (text.size() > 2 && text[1] == L':' && (text[2] == L'\\' || text[2] == L'/')) {
+        if (!shouldSkip &&
+            text.size() > 2 && text[1] == L':' && (text[2] == L'\\' || text[2] == L'/')) {
             shouldSkip = true;
+            ++Config::Guards.skipUrlOrPath;
+            Dbg("SKIP: skip_url_or_path (drive-path pattern in cache)");
         }
         // Require a minimum number of actual letter characters.
         // This replaces the old ">50% alpha ratio" check — we now insist on
         // at least EarlyDetectionMinChars real letter characters so that
         // entries like "// x" or "; ab" (lots of symbols, few letters) are
         // ignored early without entering the expensive detection path.
-        if (alphaCount < static_cast<size_t>(Config::EarlyDetectionMinChars) ||
-            detectionText.size() < static_cast<size_t>(Config::EarlyDetectionMinChars)) {
+        if (!shouldSkip &&
+            (alphaCount < static_cast<size_t>(Config::EarlyDetectionMinChars) ||
+             detectionText.size() < static_cast<size_t>(Config::EarlyDetectionMinChars))) {
             shouldSkip = true;
+            ++Config::Guards.skipLowAlpha;
+            Dbg("SKIP: skip_low_alpha (alpha=%zu detText=%zu minChars=%d)",
+                alphaCount, detectionText.size(), Config::EarlyDetectionMinChars);
         }
 
         if (!shouldSkip) {
@@ -1740,6 +1801,31 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 textVariants = std::move(unique);
             }
 
+            // ── Hebrew final-form normalised variants (Iteration 2 — B) ──
+            // For any variant that contains Hebrew characters (including
+            // sofit forms ך ם ן ף ץ), add a normalised copy so that
+            // TypoResilientDetect can pick up the higher-confidence score.
+            // The normalised strings are model-input only; the user's
+            // original text is used for the actual backspace/retype.
+            {
+                std::vector<std::wstring> toAdd;
+                std::set<std::wstring> existing(textVariants.begin(), textVariants.end());
+                for (const auto& v : textVariants) {
+                    bool hasHebrew = false;
+                    for (wchar_t c : v) {
+                        if (c >= 0x05D0 && c <= 0x05EA) { hasHebrew = true; break; }
+                    }
+                    if (hasHebrew) {
+                        std::wstring normed = NormalizeHebrewFinals(v);
+                        if (normed != v && existing.find(normed) == existing.end()) {
+                            existing.insert(normed);
+                            toAdd.push_back(std::move(normed));
+                        }
+                    }
+                }
+                for (auto& v : toAdd) textVariants.push_back(std::move(v));
+            }
+
             // Typo-resilient detection: consecutive agreement + drop-one boosting
             // Uses per-language-pair parameters for confidence thresholds.
             // alphaCount (not cacheSize) is used as numChars so that non-alpha
@@ -1771,6 +1857,33 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 }
 
                 if (currentLangId != bestLang) {
+
+                    // ── File-dialog English protection (Iteration 3 — C) ──
+                    // When the user has English active and is typing in a file
+                    // save/open dialog, block automatic switches to Hebrew or
+                    // Russian.  Filename entry is almost always Latin; a false
+                    // positive here is worse than a missed correction.
+                    // Manual layout switches by Alt+Shift are never affected.
+                    if (Config::DisableAutoSwitchFromEnglishInFileDialogs &&
+                        currentLangId == "en" &&
+                        (bestLang == "he" || bestLang == "ru"))
+                    {
+                        FileDialogConfidence fdCtx =
+                            IsFileDialogContext(g_lastForegroundHwnd);
+                        if (fdCtx != FileDialogConfidence::None) {
+                            ++Config::Guards.skipFileDialogEnProtection;
+                            Dbg("SKIP: skip_file_dialog_en_protection "
+                                "(en→%s blocked in %s file-dialog, hwnd=%p)",
+                                bestLang.c_str(),
+                                fdCtx == FileDialogConfidence::Definite
+                                    ? "definite" : "probable",
+                                g_lastForegroundHwnd);
+                            // Clear cache so a fresh word gets a fair shot
+                            g_cache.Clear();
+                            g_history.Clear();
+                            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+                        }
+                    }
 
                     // Guard: reject detection if converting from the
                     // current layout to the detected layout would lose
@@ -1933,6 +2046,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (blocked) BlockInput(FALSE);
                     g_isSendingInput.store(false);
                     didCorrection = true;
+                    ++Config::Guards.correctionsApplied;
 
                     // Record correction time for the grace-period guard
                     // against false manual-switch detection (windows that
@@ -2359,6 +2473,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         // Periodic cleanup of closed windows from the tracker
         if (g_windows) {
             g_windows->Cleanup();
+        }
+        // Dump skip-reason guard counters to the debug log
+        if (g_debugLogEnabled) {
+            Dbg("GUARD-STATS: %s", Config::Guards.Summary().c_str());
         }
         return 0;
     }

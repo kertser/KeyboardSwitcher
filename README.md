@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.17
+# Keyboard Switcher v1.2.18
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -7,6 +7,7 @@ Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on 
 ## Table of Contents
 - [Project Description](#project-description)
 - [Features](#features)
+- [Detection Pipeline](#detection-pipeline)
 - [Project Structure](#project-structure)
 - [Model Training & Export](#model-training--export)
 - [C++ Version](#c-version)
@@ -17,44 +18,104 @@ Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on 
 - [License](#license)
 
 ## Project Description
-The main idea was to resolve the annoying situation when you are working with different
-languages (in our case Russian, Hebrew and English) and constantly have to switch between
-them — for example when switching between the browser (English layout for the URL)
-and a text chat (Hebrew or Russian layout).
 
-To get the result we collected a large dataset based on English, Hebrew and Russian dictionaries
-and trained a deep-learning model with a relatively simple LSTM architecture to detect the
-language properly.
+The main idea was to resolve the annoying situation when you are working with multiple
+languages (English, Hebrew, and Russian) and constantly have to switch between them —
+for example when switching between the browser (English layout for the URL) and a text
+chat (Hebrew or Russian layout).
 
-The PyTorch model is trained on GPU but runs on CPU without any problem.
-The accuracy is above 99% on the test set.
-
-The C++ version uses the model exported to ONNX format for fast native inference
-via ONNX Runtime.
+A large dataset was collected from English, Hebrew, and Russian dictionaries and used to
+train a deep-learning model with an LSTM architecture that detects the intended language
+with >99 % accuracy on the test set. The PyTorch model is trained on GPU but runs on
+CPU without any problem; the C++ version uses the model exported to ONNX format for fast
+native inference via ONNX Runtime.
 
 ## Features
+
+### Core behaviour
 
 | Feature | Description |
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
-| **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow/navigation keys, or manual layout switch |
-| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language, a fallback detection tries the next-best language so the full word is still corrected rather than left partially fixed |
-| **Clipboard preservation** | Clipboard content is saved before and restored immediately after each correction paste (while input is still blocked); a 300 ms fallback timer with stale-message guard handles edge cases, so your clipboard is never lost — even in multi-process apps like Chrome |
+| **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow / navigation keys, or manual layout switch |
+| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
-| **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while ru↔he requires more context |
-| **Typo resilience** | Two-tier protection against single-character typos: *consecutive-agreement* (requires 2+ keystrokes to agree on a language before switching) and *drop-one boosting* (if confidence is borderline, tries removing each character to recover from a typo) |
+| **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while en/ru→he uses a tighter floor (0.75) to reduce false positives |
+| **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo) |
+| **Capitalization preservation** | If the first letter was typed with Shift the corrected text keeps the capital letter |
+
+### Guards & noise filtering
+
+| Guard | Skip reason logged | Description |
+|---|---|---|
+| **URL / path filter** | `skip_url_or_path` | Skips detection for `://`, `www.`, `http`, and `X:\` drive-path patterns |
+| **Low-alpha filter** | `skip_low_alpha` | Requires at least *EarlyDetectionMinChars* real letter characters before detection runs |
+| **Low known-chars gate** | `skip_low_known_chars` | Skips ONNX inference when fewer than *MinKnownCharsForInference* (default **2**) characters appear in the model vocabulary — prevents noise or symbol-only input from reaching the model |
+| **Leaked-layout guard** | — | Rejects corrections where the source→target layout conversion would produce unmapped (leaked) characters |
+| **File-dialog protection** | `skip_file_dialog_en_protection` | When the active window is a file-open / save-as dialog (`#32770` + `DirectUIHWND` or `ComboBoxEx32`) and the current layout is English, auto-switching to Hebrew or Russian is blocked — filename entry is almost always Latin. Manual layout switches (Alt+Shift) are never affected. Controlled by **DisableAutoSwitchFromEnglishInFileDialogs** (default: on) |
+
+### Hebrew-specific improvements
+
+| Feature | Description |
+|---|---|
+| **Final-form normalisation** | When a detection variant contains Hebrew characters the model also receives a normalised copy with sofit (word-final) forms replaced by their base equivalents — ך→כ, ם→מ, ן→נ, ף→פ, ץ→צ. The higher confidence score of the two runs is kept. The user's text is **never** modified by this normalisation |
+
+### Window & session management
+
+| Feature | Description |
+|---|---|
 | **Per-window language memory** | Remembers the language for each window/tab and restores it on focus change |
-| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), the saved language is updated and detection stays active to catch layout mistakes |
-| **LED state indicator** | Tray icon shows a glowing red dot while the language is undetected, switching to green once the language is detected or manually confirmed |
-| **Capitalization preservation** | If the first letter was typed with Shift, the corrected text keeps the capital letter |
+| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), the saved language is updated and detection is confirmed for that context |
+| **Alt+Tab / focus awareness** | Restores the per-window language after Alt+Tab, taskbar clicks, and virtual-desktop switches via WinEvent hooks |
+| **Post-correction grace period** | Suppresses false "manual switch" detection when a window (e.g. a common file dialog) reverts the layout change that the switcher just applied |
+
+### UI & observability
+
+| Feature | Description |
+|---|---|
+| **LED state indicator** | Tray icon shows a glowing red dot while the language is undetected, switching to green once detected or manually confirmed |
 | **Dynamic tray tooltip** | Hovering the tray icon shows the current language (e.g. "Keyboard Switcher — English") |
-| **Confidence tuning** | Left-click the tray icon to adjust short/long text confidence thresholds via sliders |
-| **System tray menu** | Right-click to enable/disable the switcher, toggle window-state saving, typo resilience, debug log, or exit |
-| **Debug log** | Toggle from the tray menu — timestamped entries written to `ks_debug.log` next to the exe (auto-rolls at 512 KB) |
-| **Alt+Tab awareness** | Restores the per-window language after Alt+Tab switching |
-| **Edge-case filtering** | Skips detection for URLs, file paths, and mostly non-alphabetic input |
-| **Auto-update check** | On startup (after a short delay) and via _Check for Updates_ in the tray menu, the app queries the latest GitHub release; if a newer version is available it downloads the installer and runs it automatically |
+| **Confidence tuning** | Left-click the tray icon to adjust short / long text confidence thresholds via sliders |
+| **System tray menu** | Right-click to enable / disable the switcher, toggle window-state saving, typo resilience, debug log, feedback collection, or exit |
+| **Debug log** | Toggle from the tray menu — timestamped entries written to `ks_debug.log` next to the exe (auto-rolls at 512 KB). All skip-reason codes are logged inline. Every 60 s a **GUARD-STATS** line reports aggregate skip-reason counters so false-positive patterns are easy to spot |
+| **Auto-update check** | On startup (with a short delay) and via _Check for Updates_ in the tray menu, the app queries the latest GitHub release; if a newer version is found it downloads the installer and runs it automatically |
 | **Input collision guard** | Blocks real keystrokes during the retyping phase to prevent garbled output |
+
+## Detection Pipeline
+
+The pipeline runs on every keystroke while detection is active (`SEARCH = true`):
+
+```
+1. collect     InputCache accumulates raw keystrokes
+
+2. sanitize    Build detectionText: alpha + spaces, trimmed
+               Guards: skip_url_or_path → skip_low_alpha
+
+3. variants    Generate up to 6 layout-converted variants (en↔ru↔he)
+               + Hebrew final-form normalised copies of any Hebrew variant
+               Deduplicate
+
+4. infer       TypoResilientDetect over all variants:
+                 Per variant → PredictLanguageWithConfidence
+                   → MinKnownCharsForInference gate (skip_low_known_chars)
+                   → ONNX inference (softmax, 4 classes: N/A, en, he, ru)
+                   → Hebrew sofit normalisation boost (if Hebrew chars present)
+                 Pick best-confidence language across all variants
+                 Consecutive-agreement gate  (Tier 1)
+                 Drop-one boosting in borderline zone  (Tier 2)
+
+5. post-filter skip_file_dialog_en_protection  (en→he/ru in file dialogs)
+               Leaked-layout guard
+               Learned-exception check → fallback detection if blocked
+
+6. correct     Backspace cached text → switch layout → retype corrected text
+               Save language for this window / context
+               Record LastCorrection for Esc-undo
+               ++Guards.correctionsApplied
+```
+
+`Config::Guards` counters are incremented at each guard and dumped to the debug log
+every 60 s as `GUARD-STATS: guards: emptyTok=N lowKnown=N …`.
 
 ## Project Structure
 
@@ -66,6 +127,7 @@ KeyboardSwitcher/
 │   ├── Languages.py         # ONNX inference & layout utilities
 │   ├── Languages_torch.py   # PyTorch model class & inference
 │   ├── tune_confidence.py   # Offline confidence-threshold tuning
+│   ├── evaluate_transitions.py  # Offline validation of all language transitions
 │   ├── requirements.txt
 │   ├── dictionary.json
 │   ├── dictionary.pkl
@@ -80,17 +142,22 @@ KeyboardSwitcher/
 │   ├── dictionary.json
 │   ├── keyboard.ico
 │   ├── include/
-│   │   ├── Config.h         # Version, adaptive curve parameters, language maps
+│   │   ├── Config.h         # Version, adaptive params, language maps,
+│   │   │                    #   MinKnownCharsForInference, file-dialog flag,
+│   │   │                    #   SkipCounters (diagnostic guards)
+│   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
+│   │   │                    #   GetCachedConversionMap, TypoResilientDetect
 │   │   ├── FeedbackLogger.h # User exception list & learned correction overrides
-│   │   ├── Languages.h
 │   │   ├── InputCache.h
 │   │   ├── WindowTracker.h
 │   │   └── TrayIcon.h
 │   ├── src/
-│   │   ├── main.cpp
-│   │   ├── Config.cpp
+│   │   ├── main.cpp         # Hook, detection pipeline, IsFileDialogContext,
+│   │   │                    #   Hebrew-norm variant injection, guard counters
+│   │   ├── Config.cpp       # Params, per-pair overrides, SkipCounters impl
+│   │   ├── Languages.cpp    # ONNX inference, RunInference helper,
+│   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap
 │   │   ├── FeedbackLogger.cpp
-│   │   ├── Languages.cpp
 │   │   ├── InputCache.cpp
 │   │   ├── WindowTracker.cpp
 │   │   └── TrayIcon.cpp
@@ -118,6 +185,7 @@ python convert_to_onnx.py
 ```
 
 Key files:
+
 | File | Purpose |
 |---|---|
 | `LangModel.ipynb` | Training notebook (PyTorch LSTM) |
@@ -178,6 +246,24 @@ Key files:
 > executable only depends on standard Windows system DLLs and the bundled
 > ONNX Runtime DLL — no MinGW runtime DLLs are required on the target machine.
 
+### Key configuration knobs (`Config.h` / `Config.cpp`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `EarlyDetectionMinChars` | 3 | Global minimum alpha chars before any detection runs |
+| `FullConfidenceChars` | 15 | Chars at which the confidence floor kicks in |
+| `ConfidenceAtMinChars` | 0.99 | Required confidence at *EarlyDetectionMinChars* |
+| `ConfidenceAtMaxChars` | 0.70 | Confidence floor at *FullConfidenceChars* and beyond |
+| `ConsecutiveAgreementCount` | 2 | Consecutive keystrokes that must agree before switching |
+| `BorderlineZoneFactor` | 0.85 | Drop-one boosting fires in `[threshold × factor, threshold]` |
+| `MinKnownCharsForInference` | 2 | Minimum chars in the model vocabulary; below this the inference call is skipped (`skip_low_known_chars`) |
+| `DisableAutoSwitchFromEnglishInFileDialogs` | true | Block en→he/ru auto-switch when a file-open/save dialog is active |
+| `EnableTypoResilience` | true | Master toggle for consecutive-agreement and drop-one boosting |
+
+Per-pair overrides (e.g. `{"en","he"}` and `{"ru","he"}`) raise `ConfidenceAtMaxChars`
+to **0.75** and keep `BorderlineZoneFactor` at **0.88** to reduce false positives on
+pairs where one script is detected more ambiguously.
+
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference
 - [nlohmann/json](https://github.com/nlohmann/json) — JSON parsing (fetched automatically by CMake)
@@ -200,7 +286,7 @@ The **NSIS installer** provides a standard Windows setup wizard with:
 
 The **ZIP** is a portable archive — just extract and run.
 
-### Full example (build + package):
+### Full example (build + package)
 
 **One-click script** (recommended):
 ```bash
@@ -219,19 +305,55 @@ cpack -G ZIP        # portable archive
 cpack -G NSIS       # installer (requires NSIS)
 ```
 
+## Windows Defender / SmartScreen
+
+Because the executable is not code-signed, Windows SmartScreen may show a warning on
+first run. Click **More info → Run anyway** to proceed. The source code is fully open
+and the build is reproducible from this repository.
+
 ## Usage
-1. Run the program — it appears as a tray icon with a coloured LED dot: **red** while the language is undetected, **green** once detected or manually confirmed.
+
+1. Run the program — it appears as a tray icon with a coloured LED dot:
+   **red** while the language is undetected, **green** once detected or manually confirmed.
 2. Click on a text area and start typing.
 3. The switcher detects the intended language and corrects the input automatically.
 4. **Press Esc** to undo the last correction (works even after typing more — up to 100 extra characters).
 5. **Left-click** the tray icon to adjust confidence thresholds via sliders.
-6. **Right-click** the tray icon to enable/disable the switcher, toggle per-window memory, typo resilience, debug log, check for updates, or exit.
+6. **Right-click** the tray icon for settings:
+   - Enable / disable the switcher
+   - Toggle per-window language memory
+   - Toggle typo resilience
+   - Toggle debug log (`ks_debug.log` next to the exe)
+   - Toggle feedback collection
+   - Reset learned exceptions
+   - Check for updates
+   - Exit
 7. Hover the tray icon to see the current keyboard layout.
 8. On startup the app silently checks GitHub for a newer release; if one is found you are prompted to download and install it. You can also check manually via **Check for Updates…** in the tray menu.
+
+### Troubleshooting with the debug log
+
+Enable **Debug Log** from the tray menu. The log file `ks_debug.log` (next to the exe)
+records every detection decision and every guard skip with its reason code:
+
+| Log tag | Meaning |
+|---|---|
+| `DETECTION:` | Model fired — language, confidence, alpha count |
+| `CORRECT:` | Correction applied — cached text → corrected text |
+| `SKIP: skip_low_alpha` | Not enough letter characters yet |
+| `SKIP: skip_url_or_path` | URL or file-path pattern detected |
+| `SKIP: skip_low_known_chars` | Fewer than *MinKnownCharsForInference* chars in vocabulary |
+| `SKIP: skip_file_dialog_en_protection` | En→He/Ru blocked in a file-open/save dialog |
+| `REJECT: leaked chars` | Layout conversion would produce unmapped characters |
+| `GUARD-STATS:` | Aggregate counter dump (every 60 s while debug log is on) |
+| `UNDO:` | Esc-undo reverting a correction |
+| `MANUAL-SWITCH:` | User switched layout manually |
+| `RESTORE-LANG:` | Per-window saved language restored on focus change |
 
 ## Contributing
 
 Pull requests are welcome!
 
 ## License
+
 This project is licensed under the MIT License — Copyright © 2025-2026 Alpha-Numerical.

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <algorithm>
 #include <numeric>
+#include <map>
 
 // nlohmann/json single-header
 #include <nlohmann/json.hpp>
@@ -88,6 +89,67 @@ std::wstring ConvertTextBidirectional(const std::wstring& text,
 }
 
 // ============================================================
+// Cached conversion maps (Iteration 4 — perf optimisation)
+// ============================================================
+// Lazily initialised on first use; thereafter returns a const ref
+// to the pre-built map.  Non-standard pairs fall back to a local
+// static (one extra allocation, but safe for unusual inputs).
+const std::unordered_map<wchar_t, wchar_t>& GetCachedConversionMap(
+    const std::wstring& sourceLayout, const std::wstring& targetLayout)
+{
+    // Key: pair of pointers to the global layout objects.
+    // Because all callers use the same three globals the pointer
+    // comparison is safe and avoids hashing large strings.
+    using PtrPair = std::pair<const std::wstring*, const std::wstring*>;
+
+    static std::map<PtrPair, std::unordered_map<wchar_t, wchar_t>> cache;
+    static bool initialised = false;
+
+    if (!initialised) {
+        const std::wstring* layouts[] = {
+            &Layouts::english_layout,
+            &Layouts::russian_layout,
+            &Layouts::hebrew_layout
+        };
+        for (auto* from : layouts)
+            for (auto* to : layouts)
+                if (from != to)
+                    cache[{from, to}] = CreateConversionMap(*from, *to);
+        initialised = true;
+    }
+
+    PtrPair key{&sourceLayout, &targetLayout};
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    // Fallback: non-standard pair — store it so the next call is fast.
+    cache[key] = CreateConversionMap(sourceLayout, targetLayout);
+    return cache[key];
+}
+
+// ============================================================
+// Hebrew final-form normalisation (Iteration 2 — B)
+// ============================================================
+// Maps word-final (sofit) Hebrew letters to their base forms.
+// Used exclusively as a model-input pre-processing step so that
+// confidence is boosted for text ending with sofit letters.
+// The original user text is never modified by this function.
+std::wstring NormalizeHebrewFinals(const std::wstring& text) {
+    std::wstring result = text;
+    for (wchar_t& ch : result) {
+        switch (ch) {
+            case 0x05DA: ch = 0x05DB; break; // ך → כ  (kaf sofit → kaf)
+            case 0x05DD: ch = 0x05DE; break; // ם → מ  (mem sofit → mem)
+            case 0x05DF: ch = 0x05E0; break; // ן → נ  (nun sofit → nun)
+            case 0x05E3: ch = 0x05E4; break; // ף → פ  (pe  sofit → pe)
+            case 0x05E5: ch = 0x05E6; break; // ץ → צ  (tsadi sofit → tsadi)
+            default: break;
+        }
+    }
+    return result;
+}
+
+// ============================================================
 // LanguageDetector implementation (ONNX Runtime)
 // ============================================================
 
@@ -163,9 +225,21 @@ std::optional<std::string> LanguageDetector::PredictLanguage(const std::wstring&
             }
         }
 
+        // ── MinKnownCharsForInference gate (Iteration 1 — A) ──────
+        // If fewer than the configured minimum characters are recognised
+        // by the model vocabulary, the input is too noisy/sparse to
+        // produce a reliable prediction.  Return nullopt early.
+        if (static_cast<int>(inputIndices.size()) < Config::MinKnownCharsForInference) {
+            ++Config::Guards.skipLowKnownChars;
+            return std::nullopt;
+        }
+
         // Pad to MAX_LENGTH
         while (static_cast<int>(inputIndices.size()) < MAX_LENGTH) {
             inputIndices.push_back(0);
+        }
+        if (static_cast<int>(inputIndices.size()) > MAX_LENGTH) {
+            inputIndices.resize(MAX_LENGTH);
         }
 
         // Truncate if longer
@@ -230,83 +304,138 @@ static std::string ClassToLanguage(int cls) {
     }
 }
 
+// Internal helper: run one ONNX inference pass and return softmax result.
+// Separated so PredictLanguageWithConfidence can call it for both the
+// original and the Hebrew-finals-normalised variant.
+static std::optional<DetectionResult> RunInference(
+    Ort::Session& session,
+    const std::unordered_map<wchar_t, int64_t>& charToIndex,
+    const std::wstring& text,
+    int maxLength)
+{
+    std::vector<int64_t> inputIndices;
+    inputIndices.reserve(maxLength);
+
+    for (wchar_t ch : text) {
+        auto it = charToIndex.find(ch);
+        if (it != charToIndex.end())
+            inputIndices.push_back(it->second);
+    }
+
+    // knownChars gate – checked by caller, but guard here too
+    if (static_cast<int>(inputIndices.size()) < Config::MinKnownCharsForInference)
+        return std::nullopt;
+
+    while (static_cast<int>(inputIndices.size()) < maxLength)
+        inputIndices.push_back(0);
+    if (static_cast<int>(inputIndices.size()) > maxLength)
+        inputIndices.resize(maxLength);
+
+    std::array<int64_t, 2> inputShape = {1, static_cast<int64_t>(maxLength)};
+    auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value inputTensor = Ort::Value::CreateTensor<int64_t>(
+        memoryInfo, inputIndices.data(), inputIndices.size(),
+        inputShape.data(), inputShape.size());
+
+    Ort::AllocatorWithDefaultOptions allocator;
+    auto inputNamePtr  = session.GetInputNameAllocated(0, allocator);
+    auto outputNamePtr = session.GetOutputNameAllocated(0, allocator);
+
+    const char* inputNames[]  = {inputNamePtr.get()};
+    const char* outputNames[] = {outputNamePtr.get()};
+
+    auto outputTensors = session.Run(
+        Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
+
+    float* outputData  = outputTensors[0].GetTensorMutableData<float>();
+    auto   outputInfo  = outputTensors[0].GetTensorTypeAndShapeInfo();
+    size_t outputSize  = outputInfo.GetElementCount();
+    if (outputSize < 4) return std::nullopt;
+
+    // Softmax
+    float maxLogit = *std::max_element(outputData, outputData + outputSize);
+    float sumExp   = 0.0f;
+    DetectionResult result = {};
+    for (size_t i = 0; i < 4; ++i) {
+        result.scores[i] = std::exp(outputData[i] - maxLogit);
+        sumExp += result.scores[i];
+    }
+    for (size_t i = 0; i < 4; ++i)
+        result.scores[i] /= sumExp;
+
+    int   bestClass = 0;
+    float bestProb  = 0.0f;
+    for (int i = 1; i < 4; ++i) {
+        if (result.scores[i] > bestProb) {
+            bestProb  = result.scores[i];
+            bestClass = i;
+        }
+    }
+
+    if (result.scores[0] > bestProb) return std::nullopt;
+
+    result.language   = ClassToLanguage(bestClass);
+    result.confidence = bestProb;
+    if (result.language.empty()) return std::nullopt;
+    return result;
+}
+
 std::optional<DetectionResult> LanguageDetector::PredictLanguageWithConfidence(const std::wstring& text) {
     if (!pImpl->session) return std::nullopt;
 
     try {
-        // Tokenize: convert characters to indices
-        std::vector<int64_t> inputIndices;
-        inputIndices.reserve(MAX_LENGTH);
-
+        // Count known chars for the gate (fast pass — no allocation)
+        int knownChars = 0;
         for (wchar_t ch : text) {
-            auto it = pImpl->charToIndex.find(ch);
-            if (it != pImpl->charToIndex.end()) {
-                inputIndices.push_back(it->second);
+            if (pImpl->charToIndex.count(ch)) ++knownChars;
+        }
+
+        // ── MinKnownCharsForInference gate (Iteration 1 — A) ──────
+        if (knownChars < Config::MinKnownCharsForInference) {
+            ++Config::Guards.skipLowKnownChars;
+            return std::nullopt;
+        }
+
+        // ── Primary inference on original text ─────────────────────
+        auto result = RunInference(*pImpl->session, pImpl->charToIndex, text, MAX_LENGTH);
+        if (!result.has_value()) return std::nullopt;
+
+        // ── Hebrew final-form normalisation boost (Iteration 2 — B) ─
+        // If the text contains any Hebrew characters (including sofit
+        // forms), run a second inference on the normalised text and keep
+        // whichever confidence is higher.  This handles words that end
+        // with ך, ם, ן, ף, ץ — the model was trained mostly on
+        // base (non-sofit) forms, so normalisation often yields a
+        // higher confidence for the Hebrew class.
+        bool hasHebrew = false;
+        for (wchar_t c : text) {
+            if (c >= 0x05D0 && c <= 0x05EA) { hasHebrew = true; break; }
+        }
+        if (hasHebrew) {
+            std::wstring normed = NormalizeHebrewFinals(text);
+            if (normed != text) {
+                auto normResult = RunInference(
+                    *pImpl->session, pImpl->charToIndex, normed, MAX_LENGTH);
+                if (normResult.has_value() &&
+                    normResult->language == result->language &&
+                    normResult->confidence > result->confidence) {
+                    // Boost: use the higher confidence but keep the
+                    // original predicted language (they agree).
+                    result->confidence = normResult->confidence;
+                    // Copy scores from the better run for full visibility
+                    std::copy(std::begin(normResult->scores),
+                              std::end(normResult->scores),
+                              std::begin(result->scores));
+                }
             }
         }
 
-        while (static_cast<int>(inputIndices.size()) < MAX_LENGTH)
-            inputIndices.push_back(0);
-        if (static_cast<int>(inputIndices.size()) > MAX_LENGTH)
-            inputIndices.resize(MAX_LENGTH);
-
-        std::array<int64_t, 2> inputShape = {1, MAX_LENGTH};
-        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value inputTensor = Ort::Value::CreateTensor<int64_t>(
-            memoryInfo, inputIndices.data(), inputIndices.size(),
-            inputShape.data(), inputShape.size());
-
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputNamePtr = pImpl->session->GetInputNameAllocated(0, allocator);
-        auto outputNamePtr = pImpl->session->GetOutputNameAllocated(0, allocator);
-
-        const char* inputNames[] = {inputNamePtr.get()};
-        const char* outputNames[] = {outputNamePtr.get()};
-
-        auto outputTensors = pImpl->session->Run(
-            Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
-
-        float* outputData = outputTensors[0].GetTensorMutableData<float>();
-        auto outputInfo = outputTensors[0].GetTensorTypeAndShapeInfo();
-        size_t outputSize = outputInfo.GetElementCount();
-        if (outputSize < 4) return std::nullopt;
-
-        // Softmax
-        float maxLogit = *std::max_element(outputData, outputData + outputSize);
-        float sumExp = 0.0f;
-        DetectionResult result = {};
-        for (size_t i = 0; i < 4; ++i) {
-            result.scores[i] = std::exp(outputData[i] - maxLogit);
-            sumExp += result.scores[i];
-        }
-        for (size_t i = 0; i < 4; ++i) {
-            result.scores[i] /= sumExp;
-        }
-
-        // Argmax (skip class 0 = N/A)
-        int bestClass = 0;
-        float bestProb = 0.0f;
-        for (int i = 1; i < 4; ++i) {
-            if (result.scores[i] > bestProb) {
-                bestProb = result.scores[i];
-                bestClass = i;
-            }
-        }
-
-        // If N/A has the highest probability, return nullopt
-        if (result.scores[0] > bestProb) return std::nullopt;
-
-        result.language = ClassToLanguage(bestClass);
-        result.confidence = bestProb;
-
-        if (result.language.empty()) return std::nullopt;
         return result;
     }
     catch (const std::exception&) {
         return std::nullopt;
     }
 }
-
 
 // ============================================================
 // DetectionHistory
