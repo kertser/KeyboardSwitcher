@@ -1782,6 +1782,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             };
 
             std::vector<std::wstring> textVariants;
+
+            // ── AddOriginalTextAsVariant (Iteration 3) ────────────────────
+            // Prepend the unmodified detection text so the ONNX model can
+            // confirm "this is already valid English/Russian" — this blocks
+            // the Hebrew script gate from firing on real EN/RU words that
+            // happen to map cleanly to Hebrew when character-converted.
+            if (Config::AddOriginalTextAsVariant) {
+                textVariants.push_back(detectionText);
+            }
+
             for (const auto& cp : convPairs) {
                 if (HasLeakedLayoutChars(detectionText, cp.from, cp.to)) {
                     continue;   // skip lossy conversion

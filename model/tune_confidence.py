@@ -395,6 +395,27 @@ class PerCharState:
     det_text_len: int        # len of detection_text (alpha+space trimmed)
     best_lang: Optional[str] # top predicted language (or None if N/A wins)
     best_conf: float         # softmax confidence of top language
+    runner_lang: str = ""    # 2nd-best language
+    runner_conf: float = 0.0 # 2nd-best confidence
+    margin: float = 0.0      # best_conf - runner_conf
+    variant_votes: int = 0   # how many variants voted for best_lang
+
+
+def _get_runner_up(result) -> tuple:
+    """Return (runner_lang, runner_conf) from a DetectionResult."""
+    if result is None:
+        return "", 0.0
+    scores = result.scores
+    class_langs = ["", "en", "he", "ru"]
+    best_lang = result.language
+    runner_conf = 0.0
+    runner_lang = ""
+    for i in range(1, 4):
+        l = class_langs[i]
+        if l != best_lang and scores[i] > runner_conf:
+            runner_conf = scores[i]
+            runner_lang = l
+    return runner_lang, runner_conf
 
 
 def precompute_case(text: str, model_args: list) -> List[PerCharState]:
@@ -402,6 +423,8 @@ def precompute_case(text: str, model_args: list) -> List[PerCharState]:
 
     Only characters at or beyond the minimum possible early_min (= 2) are
     processed; earlier positions are skipped to save time.
+    Now also records runner-up language, margin and variant_votes for the
+    margin gate and variant-consensus gate in grid search.
     """
     # Smallest early_min in the grid = 2; anything below that is always skipped
     MIN_EARLY_MIN = 2
@@ -419,15 +442,17 @@ def precompute_case(text: str, model_args: list) -> List[PerCharState]:
 
         # Always record state (grid loop needs to skip based on early_min)
         if alpha_count < MIN_EARLY_MIN or len(detection_text) < MIN_EARLY_MIN:
-            states.append(PerCharState(n, alpha_count, len(detection_text), None, 0.0))
+            states.append(PerCharState(n, alpha_count, len(detection_text),
+                                       None, 0.0))
             continue
 
         if _should_skip_detection(partial):
-            states.append(PerCharState(n, alpha_count, len(detection_text), None, 0.0))
+            states.append(PerCharState(n, alpha_count, len(detection_text),
+                                       None, 0.0))
             continue
 
         if detection_text in cache:
-            best_lang, best_conf = cache[detection_text]
+            best_lang, best_conf, runner_lang, runner_conf, variant_votes = cache[detection_text]
         else:
             variants = [convert_text_bidirectional(detection_text, src, dst)
                         for src, dst in LAYOUT_PAIRS]
@@ -435,15 +460,27 @@ def precompute_case(text: str, model_args: list) -> List[PerCharState]:
 
             best_lang = None
             best_conf = 0.0
+            best_result = None
+            lang_votes: dict = {}
             for variant in variants:
                 result = predict_language_with_confidence(variant, *model_args)
-                if result is not None and result.confidence > best_conf:
-                    best_conf = result.confidence
-                    best_lang = result.language
+                if result is not None:
+                    lang_votes[result.language] = lang_votes.get(result.language, 0) + 1
+                    if result.confidence > best_conf:
+                        best_conf = result.confidence
+                        best_lang = result.language
+                        best_result = result
 
-            cache[detection_text] = (best_lang, best_conf)
+            runner_lang, runner_conf = _get_runner_up(best_result)
+            variant_votes = lang_votes.get(best_lang, 0) if best_lang else 0
+            cache[detection_text] = (best_lang, best_conf, runner_lang, runner_conf, variant_votes)
 
-        states.append(PerCharState(n, alpha_count, len(detection_text), best_lang, best_conf))
+        margin = best_conf - runner_conf
+        states.append(PerCharState(
+            n, alpha_count, len(detection_text),
+            best_lang, best_conf,
+            runner_lang, runner_conf, margin, variant_votes,
+        ))
 
     return states
 
@@ -458,8 +495,16 @@ def simulate_detection_precomputed(
     conf_at_min: float,
     conf_at_max: float,
     consecutive_required: int = 2,
+    min_margin: float = 0.0,
+    short_extra_conf: float = 0.0,
+    variant_agree: int = 0,
 ) -> Tuple[Optional[str], int]:
     """Fast variant of simulate_detection using pre-computed model outputs.
+
+    Added parameters (Iteration 2+):
+      min_margin       – required top1-top2 confidence gap (0 = disabled)
+      short_extra_conf – extra confidence for short inputs (0 = disabled)
+      variant_agree    – min variant votes for borderline conf (0 = disabled)
 
     current_layout: the active keyboard layout (mirrors currentLangId in C++).
     Only returns a non-None language when the detected language DIFFERS from
@@ -492,9 +537,22 @@ def simulate_detection_precomputed(
         if state.best_lang == current_layout:
             continue
 
-        # Confidence gate
+        # --- Margin gate ---
+        if min_margin > 0.0 and state.margin < min_margin:
+            continue
+
+        # --- Variant consensus gate (borderline only) ---
+        if variant_agree > 0 and state.best_conf < conf_at_min * 0.99:
+            if state.variant_votes < variant_agree:
+                continue
+
+        # Confidence gate (with optional short-input boost)
+        is_short = (state.alpha_count <= early_min + 2)
         required = get_required_confidence(state.alpha_count, early_min, full_conf,
                                            conf_at_min, conf_at_max)
+        if is_short and short_extra_conf > 0.0:
+            required = min(0.9999, required + short_extra_conf)
+
         if state.best_conf >= required:
             return state.best_lang, state.n
 
@@ -576,6 +634,9 @@ def evaluate_precomputed(
     conf_at_min: float,
     conf_at_max: float,
     consecutive_required: int = 2,
+    min_margin: float = 0.0,
+    short_extra_conf: float = 0.0,
+    variant_agree: int = 0,
 ) -> Metrics:
     """Fast evaluation using precomputed per-char model states."""
     tp = fp = tn = fn = 0
@@ -589,6 +650,9 @@ def evaluate_precomputed(
             states, case.current_layout,
             early_min, full_conf, conf_at_min, conf_at_max,
             consecutive_required=consecutive_required,
+            min_margin=min_margin,
+            short_extra_conf=short_extra_conf,
+            variant_agree=variant_agree,
         )
 
         if case.is_positive:
@@ -628,19 +692,24 @@ def evaluate_precomputed(
 # Grid search
 # ---------------------------------------------------------------------------
 def build_grid() -> list:
-    """Return list of (early_min, full_conf, conf_at_min, conf_at_max) tuples."""
-    early_mins = [2, 3, 4, 5]
-    full_confs = [6, 8, 10, 12, 15]
-    conf_at_mins = [0.90, 0.93, 0.95, 0.97, 0.99]
-    conf_at_maxs = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+    """Return list of (early_min, full_conf, conf_at_min, conf_at_max,
+    min_margin, short_extra_conf) tuples."""
+    early_mins       = [2, 3, 4, 5]
+    full_confs       = [6, 8, 10, 12, 15]
+    conf_at_mins     = [0.90, 0.93, 0.95, 0.97, 0.99]
+    conf_at_maxs     = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+    min_margins      = [0.0, 0.03, 0.05, 0.08, 0.10]
+    short_extra_confs = [0.0, 0.02, 0.05]
 
     grid = []
-    for em, fc, cm, cx in itertools.product(early_mins, full_confs, conf_at_mins, conf_at_maxs):
+    for em, fc, cm, cx, mg, sec in itertools.product(
+            early_mins, full_confs, conf_at_mins, conf_at_maxs,
+            min_margins, short_extra_confs):
         if em >= fc:
             continue  # EarlyDetection must be < FullConfidence
         if cx >= cm:
             continue  # floor must be lower than initial confidence
-        grid.append((em, fc, cm, cx))
+        grid.append((em, fc, cm, cx, mg, sec))
     return grid
 
 
@@ -660,6 +729,8 @@ def print_results(results: list, top_n: int = 25):
         "FullConf",
         "ConfAtMin",
         "ConfAtMax",
+        "MinMargin",
+        "ShortExtra",
         "TP Rate",
         "FP Rate",
         "Avg Chars",
@@ -676,6 +747,8 @@ def print_results(results: list, top_n: int = 25):
             params[1],
             f"{params[2]:.2f}",
             f"{params[3]:.2f}",
+            f"{params[4]:.2f}",
+            f"{params[5]:.2f}",
             f"{m.tp_rate:.4f}",
             f"{m.fp_rate:.4f}",
             f"{m.avg_chars_to_detect:.2f}" if m.avg_chars_to_detect != float("inf") else "N/A",
@@ -762,10 +835,12 @@ def main():
     results: list = []
     t0 = time.time()
 
-    for idx, (em, fc, cm, cx) in enumerate(grid, 1):
+    for idx, (em, fc, cm, cx, mg, sec) in enumerate(grid, 1):
         m = evaluate_precomputed(cases, precomputed, em, fc, cm, cx,
-                                 consecutive_required=args.consecutive)
-        results.append(((em, fc, cm, cx), m))
+                                 consecutive_required=args.consecutive,
+                                 min_margin=mg,
+                                 short_extra_conf=sec)
+        results.append(((em, fc, cm, cx, mg, sec), m))
 
         if idx % 50 == 0 or idx == len(grid):
             elapsed = time.time() - t0
@@ -793,6 +868,8 @@ def main():
     print(f"  FullConfidenceChars    = {best_params[1]}")
     print(f"  ConfidenceAtMinChars   = {best_params[2]:.2f}")
     print(f"  ConfidenceAtMaxChars   = {best_params[3]:.2f}")
+    print(f"  MinTop1Top2Margin      = {best_params[4]:.2f}")
+    print(f"  ShortInputExtraConf    = {best_params[5]:.2f}")
     print()
     print(f"  TP rate:           {best_m.tp_rate:.4f}  ({best_m.tp_count}/{best_m.total_positives})")
     print(f"  FP rate:           {best_m.fp_rate:.4f}  ({best_m.fp_count}/{best_m.total_negatives})")
@@ -802,9 +879,11 @@ def main():
     print("=" * 70)
 
     # Compare with current defaults
-    print("\n  Comparison with CURRENT defaults (3, 10, 0.97, 0.55):")
-    current_m = evaluate_precomputed(cases, precomputed, 3, 10, 0.97, 0.55,
-                                     consecutive_required=args.consecutive)
+    print("\n  Comparison with CURRENT defaults (3, 15, 0.99, 0.70, margin=0.05, short=0.02):")
+    current_m = evaluate_precomputed(cases, precomputed, 3, 15, 0.99, 0.70,
+                                     consecutive_required=args.consecutive,
+                                     min_margin=0.05,
+                                     short_extra_conf=0.02)
     print(f"  TP rate:           {current_m.tp_rate:.4f}  ({current_m.tp_count}/{current_m.total_positives})")
     print(f"  FP rate:           {current_m.fp_rate:.4f}  ({current_m.fp_count}/{current_m.total_negatives})")
     avg_str_curr = f"{current_m.avg_chars_to_detect:.2f}" if current_m.avg_chars_to_detect != float("inf") else "N/A"
@@ -819,13 +898,15 @@ def main():
             writer = csv.writer(f)
             writer.writerow([
                 "EarlyMin", "FullConf", "ConfAtMin", "ConfAtMax",
+                "MinMargin", "ShortExtraConf",
                 "TP_Rate", "FP_Rate", "Avg_Chars", "Composite",
                 "TP", "FP", "TN", "FN",
                 "Total_Pos", "Total_Neg",
             ])
-            for (em, fc, cm, cx), m in results:
+            for (em, fc, cm, cx, mg, sec), m in results:
                 writer.writerow([
                     em, fc, f"{cm:.2f}", f"{cx:.2f}",
+                    f"{mg:.2f}", f"{sec:.2f}",
                     f"{m.tp_rate:.6f}", f"{m.fp_rate:.6f}",
                     f"{m.avg_chars_to_detect:.4f}" if m.avg_chars_to_detect != float("inf") else "",
                     f"{m.composite:.6f}",

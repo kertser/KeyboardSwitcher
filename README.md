@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.18
+# Keyboard Switcher v1.3.0
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -38,7 +38,7 @@ native inference via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow / navigation keys, or manual layout switch |
-| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
+| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected. **Prefix-aware** matching blocks a correction if the proposed text is a prefix of any stored exception. **Switch-away detection**: switching away from the corrected language within 10 s of a correction is treated as a rejection — this catches the common erase + switch + retype flow. **Learned overrides**: rejecting a correction stores the reverse direction so the same text is corrected the right way next time. Per-language cap: 500 exceptions |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while en/ru→he uses a tighter floor (0.75) to reduce false positives |
 | **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo) |
@@ -59,13 +59,16 @@ native inference via ONNX Runtime.
 | Feature | Description |
 |---|---|
 | **Final-form normalisation** | When a detection variant contains Hebrew characters the model also receives a normalised copy with sofit (word-final) forms replaced by their base equivalents — ך→כ, ם→מ, ן→נ, ף→פ, ץ→צ. The higher confidence score of the two runs is kept. The user's text is **never** modified by this normalisation |
+| **Hebrew Script Coverage Gate** | During variant iteration, any variant with ≥ 90 % Hebrew Unicode characters (U+05D0–U+05EA) is assigned a virtual "he" confidence (coverage × 0.78), provided the ONNX model did **not** strongly favour another language for that variant. Recovers phrases like "כך רציתי" where the model returns only ~56 % English. The `AddOriginalTextAsVariant` flag (original typed text prepended to the variant list) acts as an FP suppresser — real English/Russian words are recognised from the original text and block the gate from firing |
+| **Persistent Moderate Confidence Gate** | Fires when all of the last 5 frames had the same top-1 language and the average top-1 confidence ≥ 0.52. Catches "flat signal" phrases like "כל הכבוד" where the model consistently returns ~58 % Hebrew without a growing trend |
+| **Cumulative Weak Score Gate** | Tracks the average softmax score for the Hebrew class (index 2) over the last 7 frames, even when it is not the top-1 winner. Fires when the average ≥ 0.28. Helps when "he" scores ~0.30–0.35 persistently but never wins the per-frame argmax |
 
 ### Window & session management
 
 | Feature | Description |
 |---|---|
-| **Per-window language memory** | Remembers the language for each window/tab and restores it on focus change |
-| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), the saved language is updated and detection is confirmed for that context |
+| **Per-window language memory** | Remembers the language for each window/tab and restores it on focus change. Context hash is based on normalised window title; dual-hash save ensures apps whose title drifts slightly (e.g. Notepad++ prepending `*`) still restore the correct language |
+| **Manual switch detection** | If the user switches the layout manually (e.g. Alt+Shift), the saved language is updated and detection is confirmed for that context. Sets `SEARCH=false` until the next context change or mouse click |
 | **Alt+Tab / focus awareness** | Restores the per-window language after Alt+Tab, taskbar clicks, and virtual-desktop switches via WinEvent hooks |
 | **Post-correction grace period** | Suppresses false "manual switch" detection when a window (e.g. a common file dialog) reverts the layout change that the switcher just applied |
 
@@ -92,6 +95,7 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                Guards: skip_url_or_path → skip_low_alpha
 
 3. variants    Generate up to 6 layout-converted variants (en↔ru↔he)
+               + original typed text prepended as extra variant (AddOriginalTextAsVariant — FP suppresser)
                + Hebrew final-form normalised copies of any Hebrew variant
                Deduplicate
 
@@ -100,9 +104,15 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                    → MinKnownCharsForInference gate (skip_low_known_chars)
                    → ONNX inference (softmax, 4 classes: N/A, en, he, ru)
                    → Hebrew sofit normalisation boost (if Hebrew chars present)
+                   → Hebrew script coverage gate — override bestLang → "he"
+                     if variant is ≥90 % Hebrew Unicode and ONNX does not
+                     contradict (Tier 3-C)
                  Pick best-confidence language across all variants
-                 Consecutive-agreement gate  (Tier 1)
-                 Drop-one boosting in borderline zone  (Tier 2)
+                 Consecutive-agreement gate  (Tier 1)   OR
+                 Trend gate                             (Tier 2)   OR
+                 Drop-one boosting in borderline zone   (Tier 2)   OR
+                 Persistent moderate confidence gate    (Tier 3-A) OR
+                 Cumulative weak score gate             (Tier 3-B)
 
 5. post-filter skip_file_dialog_en_protection  (en→he/ru in file dialogs)
                Leaked-layout guard
@@ -147,16 +157,22 @@ KeyboardSwitcher/
 │   │   │                    #   SkipCounters (diagnostic guards)
 │   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
 │   │   │                    #   GetCachedConversionMap, TypoResilientDetect
-│   │   ├── FeedbackLogger.h # User exception list & learned correction overrides
+│   │   ├── FeedbackLogger.h # User exception list & learned correction overrides,
+│   │   │                    #   prefix-aware matching, switch-away detection,
+│   │   │                    #   exception-fallback, per-language cap (500)
 │   │   ├── InputCache.h
 │   │   ├── WindowTracker.h
 │   │   └── TrayIcon.h
 │   ├── src/
 │   │   ├── main.cpp         # Hook, detection pipeline, IsFileDialogContext,
-│   │   │                    #   Hebrew-norm variant injection, guard counters
+│   │   │                    #   Hebrew-norm variant injection, guard counters,
+│   │   │                    #   clipboard save/restore, stale-timer guard,
+│   │   │                    #   Esc-undo, switch-away detection
 │   │   ├── Config.cpp       # Params, per-pair overrides, SkipCounters impl
 │   │   ├── Languages.cpp    # ONNX inference, RunInference helper,
-│   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap
+│   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap,
+│   │   │                    #   HistoryFrame (scores[4] softmax vector),
+│   │   │                    #   MAX_WINDOW=10, Iteration-3 gate logic
 │   │   ├── FeedbackLogger.cpp
 │   │   ├── InputCache.cpp
 │   │   ├── WindowTracker.cpp
@@ -259,10 +275,22 @@ Key files:
 | `MinKnownCharsForInference` | 2 | Minimum chars in the model vocabulary; below this the inference call is skipped (`skip_low_known_chars`) |
 | `DisableAutoSwitchFromEnglishInFileDialogs` | true | Block en→he/ru auto-switch when a file-open/save dialog is active |
 | `EnableTypoResilience` | true | Master toggle for consecutive-agreement and drop-one boosting |
+| `EnableHebrewScriptGate` | true | Enable the Hebrew script coverage gate (Tier 3-C) |
+| `EnablePersistentConfGate` | true | Enable the persistent moderate confidence gate (Tier 3-A) |
+| `EnableWeakScoreGate` | true | Enable the cumulative weak score gate (Tier 3-B) |
+| `AddOriginalTextAsVariant` | true | Prepend original typed text as a variant to suppress false positives |
+| `HebrewScriptCoverageThreshold` | 0.90 | Fraction of alpha chars that must be Hebrew Unicode for the script gate to fire |
+| `HebrewScriptVirtualConf` | 0.78 | Virtual confidence assigned to a variant that passes the script coverage gate |
+| `PersistentMinSteps` | 5 | Number of consecutive history frames needed for the persistent confidence gate |
+| `PersistentMinAvgConf` | 0.52 | Average top-1 confidence threshold for the persistent gate |
+| `WeakScoreWindow` | 7 | History window (frames) for the cumulative weak score gate |
+| `WeakScoreMinAvg` | 0.28 | Average Hebrew softmax score needed to fire the weak score gate |
+| `WeakScoreClassIdx` | 2 | Softmax class index tracked by the weak score gate (2 = Hebrew) |
 
 Per-pair overrides (e.g. `{"en","he"}` and `{"ru","he"}`) raise `ConfidenceAtMaxChars`
-to **0.75** and keep `BorderlineZoneFactor` at **0.88** to reduce false positives on
-pairs where one script is detected more ambiguously.
+to **0.75**, keep `BorderlineZoneFactor` at **0.88**, and tighten `PhraseConfScale`
+to **0.72** (down from 0.80) to reduce false positives on pairs where one script
+is detected more ambiguously.
 
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference

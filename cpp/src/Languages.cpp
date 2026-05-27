@@ -7,6 +7,10 @@
 #include <algorithm>
 #include <numeric>
 #include <map>
+#include <deque>
+#include <unordered_map>
+#include <cmath>
+#include <sstream>
 
 // nlohmann/json single-header
 #include <nlohmann/json.hpp>
@@ -438,29 +442,155 @@ std::optional<DetectionResult> LanguageDetector::PredictLanguageWithConfidence(c
 }
 
 // ============================================================
+// Hebrew script coverage helper (Iteration 3)
+// ============================================================
+float ComputeHebrewScriptCoverage(const std::wstring& text) {
+    int total = 0, hebrew = 0;
+    for (wchar_t c : text) {
+        if (c == L' ' || c == L'\t') continue;
+        if (c >= 0x05D0 && c <= 0x05EA) {
+            ++hebrew;
+            ++total;
+        } else if (std::iswalpha(c)) {
+            ++total;
+        }
+    }
+    return (total > 0) ? (static_cast<float>(hebrew) / static_cast<float>(total)) : 0.0f;
+}
+
+// ============================================================
 // DetectionHistory
 // ============================================================
-void DetectionHistory::Update(const std::string& lang, float /*confidence*/) {
+void DetectionHistory::Update(const std::string& lang, float confidence,
+                               const std::string& top2lang, float top2conf,
+                               const float* scores4)
+{
     if (lang == lastLang_) {
         ++streak_;
     } else {
         lastLang_ = lang;
         streak_ = 1;
     }
+
+    // Maintain sliding window for trend gate
+    HistoryFrame frame;
+    frame.top1Lang = lang;
+    frame.top1Conf = confidence;
+    frame.top2Lang = top2lang;
+    frame.top2Conf = top2conf;
+    frame.margin   = confidence - top2conf;
+    if (scores4) {
+        for (int i = 0; i < 4; ++i) frame.scores[i] = scores4[i];
+    }
+
+    window_.push_back(frame);
+    while (static_cast<int>(window_.size()) > MAX_WINDOW)
+        window_.pop_front();
 }
 
 bool DetectionHistory::IsConsistent(const std::string& currentLang, int requiredCount) const {
     return currentLang == lastLang_ && streak_ >= requiredCount;
 }
 
+bool DetectionHistory::IsTrendStable(const std::string& toLang,
+                                      int windowSize, int minSteps,
+                                      float minSlope, float minMargin) const
+{
+    if (windowSize <= 0 || window_.empty() || minSteps <= 0) return false;
+
+    int available = static_cast<int>(window_.size());
+    int start     = std::max(0, available - windowSize);
+
+    // Collect confidence values for frames where top1Lang == toLang
+    std::vector<float> confs;
+    confs.reserve(windowSize);
+    float lastMargin = -1.0f;
+    for (int i = start; i < available; ++i) {
+        if (window_[i].top1Lang == toLang) {
+            confs.push_back(window_[i].top1Conf);
+            lastMargin = window_[i].margin;
+        }
+    }
+
+    if (static_cast<int>(confs.size()) < minSteps) return false;
+
+    // Slope check (optional — disabled when minSlope <= 0)
+    if (minSlope > 0.0f && confs.size() >= 2) {
+        float slope = (confs.back() - confs.front())
+                    / static_cast<float>(confs.size() - 1);
+        if (slope < minSlope) return false;
+    }
+
+    // Margin check in the most recent toLang frame (optional)
+    if (minMargin > 0.0f && lastMargin >= 0.0f && lastMargin < minMargin)
+        return false;
+
+    return true;
+}
+
 void DetectionHistory::Clear() {
     lastLang_.clear();
     streak_ = 0;
+    window_.clear();
+}
+
+// ── Persistent Moderate Confidence Gate (Iteration 3) ─────────────────────
+// Returns true when ALL of the last minSteps frames had top1Lang == toLang
+// AND the average confidence in those frames was >= minAvgConf.
+// A flat, persistent signal (e.g. 58% × 5 keystrokes) triggers even without
+// the growth requirement of IsTrendStable.
+bool DetectionHistory::IsPersistentModerateConf(const std::string& toLang,
+                                                float minAvgConf,
+                                                int   minSteps) const
+{
+    if (minSteps <= 0 || minAvgConf <= 0.0f || window_.empty()) return false;
+
+    int available = static_cast<int>(window_.size());
+    if (available < minSteps) return false;
+
+    float sum = 0.0f;
+    int   count = 0;
+    // Walk the tail of the window (most recent minSteps frames)
+    for (int i = available - minSteps; i < available; ++i) {
+        if (window_[i].top1Lang != toLang) return false;  // streak broken
+        sum += window_[i].top1Conf;
+        ++count;
+    }
+    return (count == minSteps) && (sum / static_cast<float>(count) >= minAvgConf);
+}
+
+// ── Cumulative Weak Score Gate (Iteration 3) ──────────────────────────────
+// Returns the average softmax score for class `classIdx` over the last
+// `windowSize` frames that have non-zero score data.  Returns 0 if none.
+float DetectionHistory::GetAvgClassScore(int classIdx, int windowSize) const
+{
+    if (classIdx < 0 || classIdx >= 4 || windowSize <= 0 || window_.empty())
+        return 0.0f;
+
+    int available = static_cast<int>(window_.size());
+    int start     = std::max(0, available - windowSize);
+
+    float sum   = 0.0f;
+    int   count = 0;
+    for (int i = start; i < available; ++i) {
+        // Only include frames where score data is present
+        bool hasData = false;
+        for (int k = 0; k < 4; ++k) if (window_[i].scores[k] != 0.0f) { hasData = true; break; }
+        if (!hasData) continue;
+        sum += window_[i].scores[classIdx];
+        ++count;
+    }
+    return (count > 0) ? (sum / static_cast<float>(count)) : 0.0f;
 }
 
 // ============================================================
 // Typo-resilient detection
 // ============================================================
+
+// Helper: map class index to language string (used in TypoResilientDetect
+// for extracting runner-up from scores[]).
+static const char* kClassLang[4] = { "", "en", "he", "ru" };
+
 std::optional<DetectionResult> TypoResilientDetect(
     LanguageDetector& detector,
     const std::vector<std::wstring>& textVariants,
@@ -471,20 +601,79 @@ std::optional<DetectionResult> TypoResilientDetect(
 {
     const bool isFallback = !excludedLangs.empty();
 
-    // --- Standard best-variant detection (same as before) ---
+    // Pre-fetch params for the →he pair (needed by the Hebrew script gate
+    // which runs inside Pass 1 before bestLang is known).
+    const auto& heParams = Config::GetParamsForPair(currentLang, "he");
+
+    // ─── Pass 1: find best language across all variants ──────────
     std::string bestLang;
     float       bestConf = 0.0f;
     std::wstring bestVariant;
+    DetectionResult bestFullResult = {};
+    std::unordered_map<std::string, int> langVotes;
+
+    // Tier 3 — Hebrew Script Coverage Gate:
+    // Track the best "virtual Hebrew confidence" seen across variants.
+    float       heScriptVirtualConf = 0.0f;
+    std::wstring heScriptVariant;
 
     for (const auto& variant : textVariants) {
         auto result = detector.PredictLanguageWithConfidence(variant);
-        if (result.has_value() && result->confidence > bestConf) {
-            // Skip languages the caller has excluded (user-rejected)
-            if (excludedLangs.count(result->language)) continue;
-            bestConf = result->confidence;
-            bestLang = result->language;
-            bestVariant = variant;
+
+        // ── Hebrew script coverage check (parallel to ONNX) ──────────
+        if (Config::EnableHebrewScriptGate &&
+            heParams.HebrewScriptVirtualConf > 0.0f &&
+            currentLang != "he" &&
+            !excludedLangs.count("he"))
+        {
+            float coverage = ComputeHebrewScriptCoverage(variant);
+            if (coverage >= heParams.HebrewScriptCoverageThreshold) {
+                // The variant looks like Hebrew text.
+                // Only apply if ONNX did NOT strongly identify this same
+                // variant as a non-Hebrew language (false-positive guard).
+                bool onnxContradicts = result.has_value() &&
+                                       result->language != "he" &&
+                                       result->confidence > 0.80f;
+                if (!onnxContradicts) {
+                    float vc = coverage * heParams.HebrewScriptVirtualConf;
+                    if (vc > heScriptVirtualConf) {
+                        heScriptVirtualConf = vc;
+                        heScriptVariant     = variant;
+                    }
+                }
+            }
         }
+
+        if (!result.has_value()) continue;
+        if (excludedLangs.count(result->language)) continue;
+
+        langVotes[result->language]++;
+        if (result->confidence > bestConf) {
+            bestConf       = result->confidence;
+            bestLang       = result->language;
+            bestVariant    = variant;
+            bestFullResult = *result;
+        }
+    }
+
+    // ── Apply Hebrew script gate if it beats ONNX ─────────────────
+    bool heScriptGateFired = false;
+    if (!isFallback &&
+        heScriptVirtualConf > bestConf &&
+        !heScriptVariant.empty())
+    {
+        bestLang    = "he";
+        bestConf    = heScriptVirtualConf;
+        bestVariant = heScriptVariant;
+        bestFullResult = {};  // no real ONNX scores for this path
+        heScriptGateFired = true;
+
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "KS:HEBREW_SCRIPT_GATE pair=%s->he virtualConf=%.3f coverage_threshold=%.2f\n",
+            currentLang.c_str(), heScriptVirtualConf,
+            heParams.HebrewScriptCoverageThreshold);
+        OutputDebugStringA(buf);
     }
 
     if (bestLang.empty()) {
@@ -492,21 +681,50 @@ std::optional<DetectionResult> TypoResilientDetect(
         return std::nullopt;
     }
 
-    // --- Look up per-pair switching parameters ---
-    const auto& params = Config::GetParamsForPair(currentLang, bestLang);
-    float requiredConfidence = params.GetRequiredConfidence(numChars);
+    // ─── Extract runner-up from the winning variant's softmax scores ─
+    // scores[0]=N/A, [1]=en, [2]=he, [3]=ru
+    std::string runnerUpLang;
+    float       runnerUpConf = 0.0f;
+    for (int i = 1; i < 4; ++i) {
+        const std::string cls = kClassLang[i];
+        if (cls == bestLang || excludedLangs.count(cls)) continue;
+        if (bestFullResult.scores[i] > runnerUpConf) {
+            runnerUpConf = bestFullResult.scores[i];
+            runnerUpLang = cls;
+        }
+    }
+    float margin = bestConf - runnerUpConf;
+    int   variantAgreement = langVotes.count(bestLang) ? langVotes.at(bestLang) : 0;
 
-    // Per-pair min-chars check: the pair may require more characters
-    // than the global minimum that was used as the early-out in the caller.
+    // ─── Look up per-pair switching parameters ────────────────────
+    const auto& params = Config::GetParamsForPair(currentLang, bestLang);
+
+    // Phrase mode: if the detection text contains a space, we have at least
+    // two words — apply PhraseConfScale to lower the required threshold.
+    bool isPhrase = false;
+    for (const auto& v : textVariants) {
+        if (v.find(L' ') != std::wstring::npos) { isPhrase = true; break; }
+    }
+    float requiredConfidence = params.GetRequiredConfidence(numChars, isPhrase);
+
+    // Per-pair min-chars check
     if (static_cast<int>(numChars) < params.EarlyDetectionMinChars) {
-        if (!isFallback) history.Update(bestLang, bestConf);
+        if (!isFallback) history.Update(bestLang, bestConf, runnerUpLang, runnerUpConf);
         return std::nullopt;
     }
 
-    // --- Tier 2: Drop-one boosting (borderline zone) ---
-    // If the confidence is close to but below the threshold, a single typo
-    // character may be dragging it down.  Try removing each character once
-    // and see if confidence jumps above the threshold.
+    // ─── Short-input extra confidence ─────────────────────────────
+    // For alphaCount in [EarlyDetectionMinChars, +2] we require a higher
+    // bar to suppress the main source of FP on short words.
+    // (Not applied in phrase mode — PhraseConfScale already adjusts threshold.)
+    bool isShortInput = (static_cast<int>(numChars) <=
+                         params.EarlyDetectionMinChars + 2);
+    if (isShortInput && !isPhrase && params.ShortInputExtraConf > 0.0f) {
+        requiredConfidence = std::min(0.9999f,
+                                      requiredConfidence + params.ShortInputExtraConf);
+    }
+
+    // ─── Tier 2: Drop-one boosting (borderline zone) ──────────────
     if (Config::EnableTypoResilience &&
         bestConf < requiredConfidence &&
         bestConf >= requiredConfidence * params.BorderlineZoneFactor &&
@@ -521,30 +739,156 @@ std::optional<DetectionResult> TypoResilientDetect(
                 res->confidence > bestConf)
             {
                 bestConf = res->confidence;
+                // Update margin with potentially higher confidence
+                margin   = bestConf - runnerUpConf;
             }
         }
     }
 
-    // --- History & consecutive-agreement gate ---
-    // When this is a fallback call (excludedLangs non-empty), skip
-    // history update and the agreement gate — the primary detection
-    // already proved consistency, and the user explicitly rejected
-    // the top choice.  We only require the confidence threshold.
+    // ─── History & consecutive-agreement gate (Tier 1) ────────────
     if (!isFallback) {
-        // Update the history with whatever language won this round.
-        history.Update(bestLang, bestConf);
+        // Pass full softmax scores when they are available
+        const float* scoresPtr = (bestFullResult.scores[0] != 0.0f ||
+                                  bestFullResult.scores[1] != 0.0f ||
+                                  bestFullResult.scores[2] != 0.0f ||
+                                  bestFullResult.scores[3] != 0.0f)
+                                     ? bestFullResult.scores
+                                     : nullptr;
+        history.Update(bestLang, bestConf, runnerUpLang, runnerUpConf, scoresPtr);
 
-        // --- Tier 1: Consecutive-agreement gate ---
         if (Config::EnableTypoResilience) {
-            if (!history.IsConsistent(bestLang, params.ConsecutiveAgreementCount)) {
+            bool agreementOk = history.IsConsistent(bestLang,
+                                                     params.ConsecutiveAgreementCount);
+
+            // Trend gate as OR-alternative to agreement gate
+            bool trendOk = false;
+            if (Config::EnableTrendGate && params.TrendWindowSize > 0) {
+                trendOk = history.IsTrendStable(
+                    bestLang,
+                    params.TrendWindowSize,
+                    params.MinStableSteps,
+                    params.MinTrendSlope,
+                    0.0f);   // margin checked separately below
+            }
+
+            // ── Tier 3-A: Persistent Moderate Confidence Gate ─────────
+            bool persistentOk = false;
+            if (Config::EnablePersistentConfGate &&
+                params.PersistentMinSteps > 0 &&
+                params.PersistentMinAvgConf > 0.0f)
+            {
+                persistentOk = history.IsPersistentModerateConf(
+                    bestLang,
+                    params.PersistentMinAvgConf,
+                    params.PersistentMinSteps);
+            }
+
+            // ── Tier 3-B: Cumulative Weak Score Gate ──────────────────
+            bool weakScoreOk = false;
+            if (Config::EnableWeakScoreGate &&
+                params.WeakScoreClassIdx >= 0 &&
+                params.WeakScoreWindow > 0 &&
+                params.WeakScoreMinAvg > 0.0f)
+            {
+                const std::string weakLang = (params.WeakScoreClassIdx == 1) ? "en" :
+                                             (params.WeakScoreClassIdx == 2) ? "he" :
+                                             (params.WeakScoreClassIdx == 3) ? "ru" : "";
+                if (weakLang == bestLang) {
+                    float avg = history.GetAvgClassScore(params.WeakScoreClassIdx,
+                                                         params.WeakScoreWindow);
+                    if (avg >= params.WeakScoreMinAvg) {
+                        weakScoreOk = true;
+                        char buf[192];
+                        std::snprintf(buf, sizeof(buf),
+                            "KS:WEAK_SCORE_GATE pair=%s->%s avgScore=%.3f "
+                            "threshold=%.3f window=%d\n",
+                            currentLang.c_str(), bestLang.c_str(),
+                            avg, params.WeakScoreMinAvg, params.WeakScoreWindow);
+                        OutputDebugStringA(buf);
+                    }
+                }
+            }
+
+            // ── Tier 3-C: Hebrew Script Gate as agreement bypass ───────
+            // When heScriptGateFired, the virtual confidence already changed
+            // bestLang to "he".  Allow it to pass the gate after the normal
+            // ConsecutiveAgreementCount steps have confirmed "he".
+            // (heScriptGateFired does NOT unconditionally skip gates — the
+            //  agreement step count is still required to prevent single-shot
+            //  false positives.  The gate simply changes what bestLang is.)
+
+            // Debug: log gate states
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "KS:GATE pair=%s->%s conf=%.3f margin=%.3f "
+                    "agree=%d trend=%d persist=%d weak=%d script=%d streak=%d varVotes=%d/%d alpha=%zu\n",
+                    currentLang.c_str(), bestLang.c_str(),
+                    bestConf, margin,
+                    (int)agreementOk, (int)trendOk,
+                    (int)persistentOk, (int)weakScoreOk,
+                    (int)heScriptGateFired,
+                    history.GetStreak(), variantAgreement,
+                    (int)textVariants.size(), numChars);
+                OutputDebugStringA(buf);
+            }
+
+            if (!agreementOk && !trendOk && !persistentOk && !weakScoreOk) {
                 return std::nullopt;
             }
+
+            // If only trend gate passed (not agreement), log it
+            if (!agreementOk && trendOk && !persistentOk && !weakScoreOk) {
+                OutputDebugStringA("KS:TREND_GATE_PASSED (agreement not met)\n");
+                if (!Config::EnableTrendGateBlock) {
+                    return std::nullopt;
+                }
+            }
+
+            if (!agreementOk && !trendOk && persistentOk) {
+                OutputDebugStringA("KS:PERSISTENT_GATE_PASSED (agreement/trend not met)\n");
+            }
         }
     }
 
+    // ─── Margin gate ──────────────────────────────────────────────
+    // Low margin means the model is split between two languages → risky.
+    if (!isFallback && params.MinTop1Top2Margin > 0.0f &&
+        margin < params.MinTop1Top2Margin)
+    {
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "KS:BLOCKED[margin] pair=%s->%s conf=%.3f margin=%.3f req=%.3f\n",
+            currentLang.c_str(), bestLang.c_str(),
+            bestConf, margin, params.MinTop1Top2Margin);
+        OutputDebugStringA(buf);
+        return std::nullopt;
+    }
+
+    // ─── Variant consensus gate ───────────────────────────────────
+    // For borderline confidence, require a minimum number of layout
+    // variants to agree on the target language.
+    if (Config::EnableVariantConsensus && !isFallback &&
+        params.VariantAgreementCount > 0 &&
+        bestConf < params.ConfidenceAtMinChars * 0.99f)
+    {
+        if (variantAgreement < params.VariantAgreementCount) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "KS:BLOCKED[variant_consensus] pair=%s->%s "
+                "votes=%d/%d required=%d conf=%.3f\n",
+                currentLang.c_str(), bestLang.c_str(),
+                variantAgreement, (int)textVariants.size(),
+                params.VariantAgreementCount, bestConf);
+            OutputDebugStringA(buf);
+            return std::nullopt;
+        }
+    }
+
+    // ─── Final confidence threshold ───────────────────────────────
     if (bestConf >= requiredConfidence) {
-        DetectionResult result = {};
-        result.language = bestLang;
+        DetectionResult result = bestFullResult;
+        result.language   = bestLang;
         result.confidence = bestConf;
         return result;
     }

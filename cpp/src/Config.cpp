@@ -13,45 +13,115 @@ namespace Config {
     // ================================================================
     // SwitchingParams – per-pair adaptive confidence curve
     // ================================================================
-    float SwitchingParams::GetRequiredConfidence(size_t numChars) const {
+    float SwitchingParams::GetRequiredConfidence(size_t numChars, bool isPhrase) const {
         int n = static_cast<int>(numChars);
+        float base;
         if (n < EarlyDetectionMinChars)
             return 1.1f;                       // impossible → no detection
         if (n >= FullConfidenceChars)
-            return ConfidenceAtMaxChars;        // floor
-
-        // Linear interpolation
-        float t = static_cast<float>(n - EarlyDetectionMinChars)
-                / static_cast<float>(FullConfidenceChars - EarlyDetectionMinChars);
-        return ConfidenceAtMinChars + t * (ConfidenceAtMaxChars - ConfidenceAtMinChars);
+            base = ConfidenceAtMaxChars;        // floor
+        else {
+            // Linear interpolation
+            float t = static_cast<float>(n - EarlyDetectionMinChars)
+                    / static_cast<float>(FullConfidenceChars - EarlyDetectionMinChars);
+            base = ConfidenceAtMinChars + t * (ConfidenceAtMaxChars - ConfidenceAtMinChars);
+        }
+        // Phrase mode: lower the threshold when text is a multi-word phrase.
+        // The margin gate (MinTop1Top2Margin) already ensures signal quality,
+        // so reducing the absolute threshold here is safe.
+        if (isPhrase && PhraseConfScale < 1.0f)
+            base *= PhraseConfScale;
+        return base;
     }
 
     // ── Global default parameters ──────────────────────────────────
+    // Field order: EarlyMin, FullConf, ConfAtMin, ConfAtMax,
+    //              ConsecAgree, BorderlineFactor,
+    //              MinMargin, VariantAgree,
+    //              TrendWindow, MinSteps, MinSlope,
+    //              ShortExtraConf, PhraseConfScale,
+    //              HebrewScriptVC, HebrewScriptThresh,
+    //              PersistMinAvg, PersistMinSteps,
+    //              WeakScoreClassIdx, WeakScoreMinAvg, WeakScoreWindow
     SwitchingParams DefaultParams = {
-        /* EarlyDetectionMinChars  */ 3,
-        /* FullConfidenceChars     */ 15,
-        /* ConfidenceAtMinChars    */ 0.99f,
-        /* ConfidenceAtMaxChars    */ 0.70f,
+        /* EarlyDetectionMinChars    */ 3,
+        /* FullConfidenceChars       */ 15,
+        /* ConfidenceAtMinChars      */ 0.99f,
+        /* ConfidenceAtMaxChars      */ 0.70f,
         /* ConsecutiveAgreementCount */ 2,
-        /* BorderlineZoneFactor    */ 0.85f,
+        /* BorderlineZoneFactor      */ 0.85f,
+        /* MinTop1Top2Margin         */ 0.05f,
+        /* VariantAgreementCount     */ 0,
+        /* TrendWindowSize           */ 4,
+        /* MinStableSteps            */ 2,
+        /* MinTrendSlope             */ 0.0f,
+        /* ShortInputExtraConf       */ 0.02f,
+        /* PhraseConfScale           */ 1.0f,
+        /* HebrewScriptVirtualConf   */ 0.0f,   // disabled for non-→he pairs
+        /* HebrewScriptCovThreshold  */ 0.90f,
+        /* PersistentMinAvgConf      */ 0.0f,   // disabled by default
+        /* PersistentMinSteps        */ 0,
+        /* WeakScoreClassIdx         */ -1,     // disabled by default
+        /* WeakScoreMinAvg           */ 0.0f,
+        /* WeakScoreWindow           */ 0,
     };
 
     // ── Per-pair overrides ─────────────────────────────────────────
+    // Column order matches SwitchingParams field declaration order.
+    //
+    // Notes on VariantAgreementCount for →he pairs:
+    //   Hebrew detection typically produces exactly ONE valid variant.
+    //   Requiring VariantAgree>0 for →he would block virtually all correct
+    //   detections.  Keep it at 0 (disabled) for →he.
+    //
+    // Notes on HebrewScriptVirtualConf:
+    //   Only meaningful for →he pairs.  The script gate assigns a virtual
+    //   "he" confidence equal to (coverage × HebrewScriptVirtualConf) when a
+    //   variant is ≥ HebrewScriptCoverageThreshold Hebrew Unicode chars AND
+    //   ONNX did not strongly claim a non-Hebrew language for that variant.
+    //   Virtual conf must beat the bestConf from ONNX to override.
+    //   0.78 means a 100%-Hebrew variant gets virtual conf 0.78 — enough to
+    //   beat EN at 56% (כך רציתי) but not enough to beat RU at 99.8%.
+    //
+    // Notes on WeakScoreGate for →he:
+    //   classIdx=2 tracks the "he" softmax score even when "he" is not top-1.
+    //   WeakScoreMinAvg=0.28 over 6 frames fires when Hebrew receives a weak
+    //   but persistent signal that is unmistakably above the random baseline.
     std::map<LangPair, SwitchingParams> PairOverrides = {
-        // ── English ↔ Russian ───
-        { {"en", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
-        { {"ru", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
+        // ── English ↔ Russian ───────────────────────────────────────────
+        //  EMin FConf CAt0  CAt1  Agr BLF   Mrg  VA  TWin MnSt Slp  SXC  PCS
+        //  HeSVC HeSCT  PerAv PrSt  WSC   WSA   WSW
+        { {"en", "ru"}, {
+            3,    15, 0.99f, 0.70f,  2, 0.85f, 0.05f, 0,   4,   2, 0.0f, 0.02f, 1.00f,
+            0.0f, 0.90f, 0.0f, 0,  -1, 0.0f, 0 } },
+        { {"ru", "en"}, {
+            3,    15, 0.99f, 0.70f,  2, 0.85f, 0.05f, 0,   4,   2, 0.0f, 0.02f, 1.00f,
+            0.0f, 0.90f, 0.0f, 0,  -1, 0.0f, 0 } },
 
-        // ── English ↔ Hebrew ───
-        // en→he: raised ConfAtMax to 0.75 (P1 D: tighter for short wds)
-        //        BorderlineFactor 0.88 reduces FP boost zone
-        { {"en", "he"}, { 3, 15, 0.99f, 0.75f, 2, 0.88f } },
-        { {"he", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
+        // ── English → Hebrew ────────────────────────────────────────────
+        // PhraseConfScale=0.72  (threshold reduced by 28% for multi-word phrases)
+        // HebrewScriptVC=0.78   (100%-Hebrew variant → virtual conf 0.78)
+        // PersistentGate=0.52/5 (5 consecutive steps at avg≥52% → fire)
+        // WeakScoreGate: track Hebrew class (idx=2); avg≥0.28 over 7 frames
+        { {"en", "he"}, {
+            3,    15, 0.97f, 0.65f,  2, 0.88f, 0.10f, 0,   4,   2, 0.0f, 0.0f,  0.72f,
+            0.78f, 0.90f, 0.52f, 5,   2, 0.28f, 7 } },
 
-        // ── Russian ↔ Hebrew ───
-        // ru→he: same reasoning as en→he, tighter floor
-        { {"ru", "he"}, { 3, 15, 0.99f, 0.75f, 2, 0.88f } },
-        { {"he", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.80f } },
+        // ── Hebrew → English ────────────────────────────────────────────
+        { {"he", "en"}, {
+            3,    15, 0.99f, 0.70f,  2, 0.85f, 0.05f, 0,   4,   2, 0.0f, 0.02f, 1.00f,
+            0.0f, 0.90f, 0.0f, 0,  -1, 0.0f, 0 } },
+
+        // ── Russian → Hebrew ────────────────────────────────────────────
+        // Same Iteration-3 gates as en→he.
+        { {"ru", "he"}, {
+            3,    15, 0.97f, 0.65f,  2, 0.88f, 0.10f, 0,   4,   2, 0.0f, 0.0f,  0.72f,
+            0.78f, 0.90f, 0.52f, 5,   2, 0.28f, 7 } },
+
+        // ── Hebrew → Russian ────────────────────────────────────────────
+        { {"he", "ru"}, {
+            3,    15, 0.99f, 0.70f,  2, 0.80f, 0.05f, 0,   4,   2, 0.0f, 0.02f, 1.00f,
+            0.0f, 0.90f, 0.0f, 0,  -1, 0.0f, 0 } },
     };
 
     const SwitchingParams& GetParamsForPair(const std::string& fromLang,
@@ -76,6 +146,17 @@ namespace Config {
 
     // ── Typo resilience master toggle ──
     bool  EnableTypoResilience = true;
+
+    // ── Trend Gate / Variant Consensus feature flags ────────────────
+    bool  EnableTrendGate       = true;  // compute & use trend gate
+    bool  EnableTrendGateBlock  = true;  // actually block (false = log-only)
+    bool  EnableVariantConsensus = true; // variant-agreement gate
+
+    // ── Iteration 3 feature flags ───────────────────────────────────
+    bool  EnableHebrewScriptGate    = true;  // Hebrew Unicode coverage gate
+    bool  EnablePersistentConfGate  = true;  // flat persistent confidence gate
+    bool  EnableWeakScoreGate       = true;  // cumulative weak class-score gate
+    bool  AddOriginalTextAsVariant  = true;  // prepend raw input to variants
 
     // ── New parameters (Iteration 1) ───────────────────────────────
     // Minimum known-char count for ONNX inference.  2 keeps very short

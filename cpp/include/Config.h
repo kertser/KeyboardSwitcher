@@ -43,8 +43,87 @@ namespace Config {
         int   ConsecutiveAgreementCount; // consecutive keystrokes must agree
         float BorderlineZoneFactor;     // drop-one boosting triggers in [threshold*factor, threshold]
 
-        // Compute the required softmax confidence for a given text length
-        float GetRequiredConfidence(size_t numChars) const;
+        // ── Trend Gate & signal-quality gates (Iteration 2+) ──────────
+        // MinTop1Top2Margin: required gap between top-1 and top-2 softmax
+        //   probabilities. 0.0 = disabled.  Prevents corrections when the
+        //   model is split between two languages.
+        float MinTop1Top2Margin;
+
+        // VariantAgreementCount: minimum number of layout-conversion variants
+        //   that must agree on the same target language.  0 = disabled.
+        //   Applied only when confidence is below ConfidenceAtMinChars to
+        //   avoid slowing down high-confidence detections.
+        int   VariantAgreementCount;
+
+        // TrendWindowSize / MinStableSteps / MinTrendSlope:
+        //   Sliding-window trend gate used as an OR-alternative to the
+        //   ConsecutiveAgreementCount gate.  The window stores the last N
+        //   detection observations; IsTrendStable() returns true when at
+        //   least MinStableSteps of them confirm the target language AND
+        //   the confidence slope is >= MinTrendSlope.  0 disables each.
+        int   TrendWindowSize;
+        int   MinStableSteps;
+        float MinTrendSlope;         // per-step minimum slope (0 = ignore slope)
+
+        // ShortInputExtraConf: extra confidence added on top of the adaptive
+        //   threshold when alphaCount is in [EarlyDetectionMinChars, +2].
+        //   Aggressively guards against FP on very short input.
+        float ShortInputExtraConf;
+
+        // PhraseConfScale: when the detection text contains a space (phrase
+        //   context, not a single word), multiply the required confidence by
+        //   this factor.  1.0 = no change.  0.85 means the threshold is 15%
+        //   lower for multi-word input.  This improves recall on short Hebrew
+        //   phrases like "תודה רבה" where individual words have borderline
+        //   confidence but the combination is unambiguous.
+        float PhraseConfScale;
+
+        // ── Hebrew Script Coverage Gate (Iteration 3) ─────────────────
+        // HebrewScriptVirtualConf: when a layout-conversion variant contains
+        //   >= HebrewScriptCoverageThreshold fraction of Hebrew Unicode chars
+        //   (U+05D0–U+05EA) AND the ONNX model did NOT strongly claim a
+        //   non-Hebrew language for that same variant, assign this virtual
+        //   confidence to "he".  If it beats the current bestConf the gate
+        //   overrides the ONNX winner.
+        //   0.0 = disabled.  Typical: 0.78 for →he pairs.
+        float HebrewScriptVirtualConf;
+
+        // HebrewScriptCoverageThreshold: minimum Hebrew character fraction
+        //   required to trigger the script gate.  0.90 = 90 % of alpha chars
+        //   must be Hebrew Unicode.  Higher = fewer false positives.
+        float HebrewScriptCoverageThreshold;
+
+        // ── Persistent Moderate Confidence Gate (Iteration 3) ──────────
+        // PersistentMinAvgConf: the gate fires when ALL of the last
+        //   PersistentMinSteps frames had top1Lang == bestLang AND the
+        //   average top1Conf was >= this value.  Catches the case where
+        //   the model gives a flat ~58 % confidence across many keystrokes
+        //   — below the trend gate's growth requirement but clearly not noise.
+        //   0.0 = disabled.  Typical: 0.52 for →he pairs.
+        float PersistentMinAvgConf;
+
+        // PersistentMinSteps: minimum consecutive frames required for the
+        //   persistent gate.  Typical: 5 for →he pairs.
+        int   PersistentMinSteps;
+
+        // ── Cumulative Weak Score Gate (Iteration 3) ───────────────────
+        // WeakScoreClassIdx: softmax class index to track (2 = Hebrew).
+        //   Set to -1 to disable.
+        int   WeakScoreClassIdx;
+
+        // WeakScoreMinAvg: minimum average softmax score for the tracked
+        //   class over WeakScoreWindow frames (even when that class is NOT
+        //   top-1).  Catches persistent weak "he" signal below the
+        //   top-1 threshold.  Must be well above random (>= 0.20 suggested).
+        float WeakScoreMinAvg;
+
+        // WeakScoreWindow: sliding-window size for the weak-score gate.
+        int   WeakScoreWindow;
+
+        // Compute the required softmax confidence for a given text length.
+        // isPhrase: true when the detection text contains a space — in that
+        //   case PhraseConfScale is applied to lower the threshold.
+        float GetRequiredConfidence(size_t numChars, bool isPhrase = false) const;
     };
 
     // Global default parameters (used as fallback for unlisted pairs)
@@ -75,6 +154,43 @@ namespace Config {
 
     // Master toggle for typo resilience (applies to all pairs)
     extern bool  EnableTypoResilience;
+
+    // ── Trend Gate feature flags ───────────────────────────────────────
+    // EnableTrendGate: when true, IsTrendStable() is evaluated and used as
+    //   an OR-alternative to the consecutive-agreement gate.  Default: true.
+    // EnableTrendGateBlock: when false (log-only mode), the trend gate is
+    //   computed and logged but never blocks a correction.  Default: true.
+    // EnableVariantConsensus: require VariantAgreementCount variants to
+    //   agree before firing on borderline-confidence input.  Default: true.
+    extern bool  EnableTrendGate;
+    extern bool  EnableTrendGateBlock;
+    extern bool  EnableVariantConsensus;
+
+    // ── Iteration 3 feature flags ──────────────────────────────────────
+    // EnableHebrewScriptGate: activates the Hebrew Unicode coverage gate
+    //   inside TypoResilientDetect.  When a layout-converted variant is
+    //   >= HebrewScriptCoverageThreshold Hebrew chars AND the ONNX model
+    //   did not strongly claim another language for that variant, a virtual
+    //   "he" confidence (HebrewScriptVirtualConf) is assigned.  Default: true.
+    extern bool  EnableHebrewScriptGate;
+
+    // EnablePersistentConfGate: activates the "N consecutive frames of the
+    //   same language at moderate confidence" gate as a third OR-alternative
+    //   to agreement/trend.  Default: true.
+    extern bool  EnablePersistentConfGate;
+
+    // EnableWeakScoreGate: activates the cumulative weak softmax-score gate.
+    //   Tracks the avg softmax for a specific class (e.g. Hebrew = 2) even
+    //   when it is not top-1; fires when the average exceeds WeakScoreMinAvg
+    //   over WeakScoreWindow frames.  Default: true.
+    extern bool  EnableWeakScoreGate;
+
+    // AddOriginalTextAsVariant: when true, the unmodified detectionText is
+    //   prepended to textVariants before ONNX inference.  This lets the model
+    //   confirm "this text is already correct English/Russian" and naturally
+    //   suppresses false-positive Hebrew corrections on real en/ru words.
+    //   Default: true.
+    extern bool  AddOriginalTextAsVariant;
 
     // ================================================================
     // New parameters (Iteration 1)
