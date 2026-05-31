@@ -43,8 +43,38 @@ namespace Config {
         int   ConsecutiveAgreementCount; // consecutive keystrokes must agree
         float BorderlineZoneFactor;     // drop-one boosting triggers in [threshold*factor, threshold]
 
-        // Compute the required softmax confidence for a given text length
-        float GetRequiredConfidence(size_t numChars) const;
+        // ── Signal-quality gates (ported from 1.3.0) ──────────────────
+        // MinTop1Top2Margin: required gap between the top-1 and top-2 softmax
+        //   probabilities. 0.0 = disabled. Blocks corrections when the model
+        //   is split between two languages (a major false-positive source).
+        float MinTop1Top2Margin;
+
+        // ShortInputExtraConf: extra confidence added on top of the adaptive
+        //   threshold when numChars is in [EarlyDetectionMinChars, +2].
+        //   Tightens the bar on very short input. 0.0 = disabled.
+        float ShortInputExtraConf;
+
+        // PhraseConfScale: when the detection text contains a space (multi-word
+        //   phrase), multiply the required confidence by this factor.
+        //   1.0 = no change; 0.80 = 20 % lower threshold for phrases. Improves
+        //   recall on short Hebrew phrases whose individual words are borderline.
+        float PhraseConfScale;
+
+        // HebrewScriptVirtualConf: when a layout-conversion variant is
+        //   >= HebrewScriptCoverageThreshold Hebrew Unicode chars (U+05D0–U+05EA)
+        //   AND the ONNX model did NOT strongly claim a non-Hebrew language for
+        //   that variant, assign this virtual confidence to "he". If it beats the
+        //   ONNX winner the gate overrides it. 0.0 = disabled (non-→he pairs).
+        float HebrewScriptVirtualConf;
+
+        // HebrewScriptCoverageThreshold: minimum Hebrew-character fraction
+        //   required to trigger the script gate (0.90 = 90 % of alpha chars).
+        float HebrewScriptCoverageThreshold;
+
+        // Compute the required softmax confidence for a given text length.
+        // isPhrase: true when the detection text contains a space — PhraseConfScale
+        //   is then applied to lower the threshold.
+        float GetRequiredConfidence(size_t numChars, bool isPhrase = false) const;
     };
 
     // Global default parameters (used as fallback for unlisted pairs)
@@ -75,6 +105,13 @@ namespace Config {
 
     // Master toggle for typo resilience (applies to all pairs)
     extern bool  EnableTypoResilience;
+
+    // ── Hebrew Script Coverage Gate (ported from 1.3.0) ───────────────
+    // When true, TypoResilientDetect assigns a virtual "he" confidence to a
+    // layout-converted variant that is >= HebrewScriptCoverageThreshold Hebrew
+    // Unicode chars AND was not strongly claimed as another language by ONNX.
+    // Catches clearly-Hebrew text the model scores ambiguously. Default: true.
+    extern bool  EnableHebrewScriptGate;
 
     // ================================================================
     // Case-signal Hebrew exclusion (Iteration 5 — A)

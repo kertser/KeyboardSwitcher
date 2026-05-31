@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <numeric>
 #include <map>
+#include <cwctype>
 
 // nlohmann/json single-header
 #include <nlohmann/json.hpp>
@@ -375,6 +376,25 @@ void DetectionHistory::Clear() {
 }
 
 // ============================================================
+// Hebrew script coverage helper (ported from 1.3.0)
+// ============================================================
+float ComputeHebrewScriptCoverage(const std::wstring& text) {
+    int alpha = 0, hebrew = 0;
+    for (wchar_t c : text) {
+        if (c == L' ') continue;
+        if (iswalpha(c)) {
+            ++alpha;
+            if (c >= 0x05D0 && c <= 0x05EA) ++hebrew;
+        }
+    }
+    if (alpha == 0) return 0.0f;
+    return static_cast<float>(hebrew) / static_cast<float>(alpha);
+}
+
+// Map softmax class index → language string (scores order: 0=N/A,1=en,2=he,3=ru)
+static const char* kClassLang[4] = { "", "en", "he", "ru" };
+
+// ============================================================
 // Typo-resilient detection
 // ============================================================
 std::optional<DetectionResult> TypoResilientDetect(
@@ -390,20 +410,65 @@ std::optional<DetectionResult> TypoResilientDetect(
     // excludedLangs may be non-empty even on a primary (non-fallback) call
     // (e.g. case-signal Hebrew exclusion) — history gate still applies.
 
-    // --- Standard best-variant detection (same as before) ---
+    // Pre-fetch →he params for the Hebrew script gate (runs during Pass 1,
+    // before bestLang is known).
+    const auto& heParams = Config::GetParamsForPair(currentLang, "he");
+
+    // --- Pass 1: find best language across all variants ---
     std::string bestLang;
     float       bestConf = 0.0f;
     std::wstring bestVariant;
+    DetectionResult bestFullResult = {};   // keeps softmax scores for margin gate
+
+    // Hebrew Script Coverage gate: best virtual-Hebrew confidence across variants.
+    float        heScriptVirtualConf = 0.0f;
+    std::wstring heScriptVariant;
 
     for (const auto& variant : textVariants) {
         auto result = detector.PredictLanguageWithConfidence(variant);
-        if (result.has_value() && result->confidence > bestConf) {
-            // Skip languages the caller has excluded (user-rejected)
-            if (excludedLangs.count(result->language)) continue;
-            bestConf = result->confidence;
-            bestLang = result->language;
-            bestVariant = variant;
+
+        // ── Hebrew script coverage check (parallel to ONNX) ──────────
+        if (Config::EnableHebrewScriptGate &&
+            heParams.HebrewScriptVirtualConf > 0.0f &&
+            currentLang != "he" &&
+            !excludedLangs.count("he"))
+        {
+            float coverage = ComputeHebrewScriptCoverage(variant);
+            if (coverage >= heParams.HebrewScriptCoverageThreshold) {
+                // Variant looks like Hebrew. Only apply if ONNX did NOT
+                // strongly identify this variant as a non-Hebrew language.
+                bool onnxContradicts = result.has_value() &&
+                                       result->language != "he" &&
+                                       result->confidence > 0.80f;
+                if (!onnxContradicts) {
+                    float vc = coverage * heParams.HebrewScriptVirtualConf;
+                    if (vc > heScriptVirtualConf) {
+                        heScriptVirtualConf = vc;
+                        heScriptVariant     = variant;
+                    }
+                }
+            }
         }
+
+        if (result.has_value() && result->confidence > bestConf) {
+            // Skip languages the caller has excluded (user-rejected / case-signal)
+            if (excludedLangs.count(result->language)) continue;
+            bestConf       = result->confidence;
+            bestLang       = result->language;
+            bestVariant    = variant;
+            bestFullResult = *result;
+        }
+    }
+
+    // --- Apply Hebrew script gate if it beats ONNX ---
+    if (!isFallback &&
+        heScriptVirtualConf > bestConf &&
+        !heScriptVariant.empty())
+    {
+        bestLang       = "he";
+        bestConf       = heScriptVirtualConf;
+        bestVariant    = heScriptVariant;
+        bestFullResult = {};   // no real ONNX scores for this path
     }
 
     if (bestLang.empty()) {
@@ -411,15 +476,44 @@ std::optional<DetectionResult> TypoResilientDetect(
         return std::nullopt;
     }
 
+    // --- Extract runner-up from the winning variant's softmax scores ---
+    std::string runnerUpLang;
+    float       runnerUpConf = 0.0f;
+    for (int i = 1; i < 4; ++i) {
+        const std::string cls = kClassLang[i];
+        if (cls == bestLang || excludedLangs.count(cls)) continue;
+        if (bestFullResult.scores[i] > runnerUpConf) {
+            runnerUpConf = bestFullResult.scores[i];
+            runnerUpLang = cls;
+        }
+    }
+    float margin = bestConf - runnerUpConf;
+
     // --- Look up per-pair switching parameters ---
     const auto& params = Config::GetParamsForPair(currentLang, bestLang);
-    float requiredConfidence = params.GetRequiredConfidence(numChars);
+
+    // Phrase mode: a space in any variant means ≥ 2 words → relax threshold.
+    bool isPhrase = false;
+    for (const auto& v : textVariants) {
+        if (v.find(L' ') != std::wstring::npos) { isPhrase = true; break; }
+    }
+    float requiredConfidence = params.GetRequiredConfidence(numChars, isPhrase);
 
     // Per-pair min-chars check: the pair may require more characters
     // than the global minimum that was used as the early-out in the caller.
     if (static_cast<int>(numChars) < params.EarlyDetectionMinChars) {
         if (!isFallback) history.Update(bestLang, bestConf);
         return std::nullopt;
+    }
+
+    // --- Short-input extra confidence (false-positive guard) ---
+    // For numChars in [EarlyDetectionMinChars, +2] raise the bar to suppress
+    // FP on very short words.  Not applied in phrase mode (PhraseConfScale
+    // already adjusts the threshold there).
+    bool isShortInput = (static_cast<int>(numChars) <= params.EarlyDetectionMinChars + 2);
+    if (isShortInput && !isPhrase && params.ShortInputExtraConf > 0.0f) {
+        requiredConfidence = std::min(0.9999f,
+                                      requiredConfidence + params.ShortInputExtraConf);
     }
 
     // --- Tier 2: Drop-one boosting (borderline zone) ---
@@ -440,6 +534,7 @@ std::optional<DetectionResult> TypoResilientDetect(
                 res->confidence > bestConf)
             {
                 bestConf = res->confidence;
+                margin   = bestConf - runnerUpConf;   // keep margin in sync
             }
         }
     }
@@ -461,8 +556,23 @@ std::optional<DetectionResult> TypoResilientDetect(
         }
     }
 
+    // --- Margin gate (false-positive guard) ---
+    // A low top1/top2 gap means the model is split between two languages.
+    // Skip on fallback, and skip when the Hebrew script gate fired (no real
+    // ONNX scores → margin is meaningless, indicated by all-zero scores).
+    {
+        bool noScores = (bestFullResult.scores[0] == 0.0f &&
+                         bestFullResult.scores[1] == 0.0f &&
+                         bestFullResult.scores[2] == 0.0f &&
+                         bestFullResult.scores[3] == 0.0f);
+        if (!isFallback && !noScores && params.MinTop1Top2Margin > 0.0f &&
+            margin < params.MinTop1Top2Margin) {
+            return std::nullopt;
+        }
+    }
+
     if (bestConf >= requiredConfidence) {
-        DetectionResult result = {};
+        DetectionResult result = bestFullResult;
         result.language = bestLang;
         result.confidence = bestConf;
         return result;

@@ -42,18 +42,22 @@ VOCAB_FILES = {
 }
 
 # Must match cpp/src/Config.cpp  — keep in sync!
-# Format: (EarlyDetectionMinChars, FullConfidenceChars,
-#           ConfidenceAtMinChars, ConfidenceAtMaxChars,
-#           ConsecutiveAgreementCount, BorderlineZoneFactor)
-DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85)
+# Format (11): (EarlyDetectionMinChars, FullConfidenceChars,
+#               ConfidenceAtMinChars, ConfidenceAtMaxChars,
+#               ConsecutiveAgreementCount, BorderlineZoneFactor,
+#               MinTop1Top2Margin, ShortInputExtraConf, PhraseConfScale,
+#               HebrewScriptVirtualConf, HebrewScriptCoverageThreshold)
+DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90)
 PAIR_OVERRIDES = {
-    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85),
-    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85),
-    # en→he / ru→he: EarlyMin=3 adds ~4 pp TP at zero FP cost (sweep-validated)
-    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88),
-    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85),
-    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88),
-    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80),
+    # Margin gate: 0.05 on robust pairs (cheap FP insurance), 0.10 on →he.
+    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
+    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
+    # en→he / ru→he: EarlyMin=3; signal-quality gates ported from 1.3.0
+    #   margin=0.10, phraseScale=0.80, hebrewScriptVirtualConf=0.78
+    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
+    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
+    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
+    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90),
 }
 
 LAYOUT_PAIRS = [
@@ -64,6 +68,21 @@ LAYOUT_PAIRS = [
     (russian_layout, hebrew_layout),
     (hebrew_layout, russian_layout),
 ]
+
+_CLASS_LANG = {1: "en", 2: "he", 3: "ru"}
+
+
+def hebrew_script_coverage(text: str) -> float:
+    """Fraction of alpha chars in the Hebrew Unicode block (U+05D0–U+05EA)."""
+    alpha = hebrew = 0
+    for c in text:
+        if c == " ":
+            continue
+        if c.isalpha():
+            alpha += 1
+            if "\u05d0" <= c <= "\u05ea":
+                hebrew += 1
+    return (hebrew / alpha) if alpha else 0.0
 
 
 def load_vocab(lang: str, sample: int, seed: int, min_len: int, max_len: int) -> List[str]:
@@ -78,14 +97,19 @@ def load_vocab(lang: str, sample: int, seed: int, min_len: int, max_len: int) ->
     return rng.sample(words, min(sample, len(words)))
 
 
-def required_confidence(n: int, params: Tuple[int, int, float, float, int, float]) -> float:
-    early_min, full_conf, conf_min, conf_max, _, _ = params
+def required_confidence(n: int, params, is_phrase: bool = False) -> float:
+    early_min, full_conf, conf_min, conf_max = params[0], params[1], params[2], params[3]
+    phrase_scale = params[8]
     if n < early_min:
         return 1.1
     if n >= full_conf:
-        return conf_max
-    t = (n - early_min) / (full_conf - early_min)
-    return conf_min + t * (conf_max - conf_min)
+        req = conf_max
+    else:
+        t = (n - early_min) / (full_conf - early_min)
+        req = conf_min + t * (conf_max - conf_min)
+    if is_phrase and 0.0 < phrase_scale < 1.0:
+        req *= phrase_scale
+    return req
 
 
 def evaluate_pair(
@@ -95,26 +119,26 @@ def evaluate_pair(
     model_args: list,
 ) -> Tuple[int, int, int, int]:
     params = PAIR_OVERRIDES.get((from_lang, to_lang), DEFAULT_PARAMS)
-    _, _, _, _, agreement_count, _ = params
-    predict_cache: Dict[str, Tuple[str | None, float]] = {}
+    agreement_count = params[4]
+    early_min       = params[0]
+    margin_min      = params[6]
+    short_extra     = params[7]
+    he_params       = PAIR_OVERRIDES.get((from_lang, "he"), DEFAULT_PARAMS)
+    he_virtual_conf = he_params[9]
+    he_cov_thresh   = he_params[10]
+    # Cache: variant -> (lang, conf, scores)
+    predict_cache: Dict[str, Tuple[str | None, float, list]] = {}
 
     def predict_best_lang(text: str, current_lang: str) -> str | None:
         last_lang = ""
         streak = 0
 
         for n in range(1, len(text) + 1):
-            required = required_confidence(n, params)
-            if required > 1.0:
-                continue
-
             # Source-restricted variants (mirror cpp/src/main.cpp):
-            # the text was physically typed on `current_lang`'s layout, so
-            # the only meaningful interpretations are the identity (text as
-            # typed) plus current_lang -> each other layout.
+            # identity (text as typed) plus current_lang -> each other layout.
             variants = []
             seen = set()
             cur_layout = LAYOUTS[current_lang]
-            # Identity: text exactly as typed (detects "no switch needed").
             variants.append(text[:n])
             seen.add(text[:n])
             for other_lang, dst_layout in LAYOUTS.items():
@@ -125,30 +149,72 @@ def evaluate_pair(
                     seen.add(variant)
                     variants.append(variant)
 
+            is_phrase = any(" " in v for v in variants)
+
             best_lang = None
             best_conf = 0.0
+            best_scores: list = [0.0, 0.0, 0.0, 0.0]
+            he_script_vc = 0.0
             for variant in variants:
                 if variant in predict_cache:
-                    lang, conf = predict_cache[variant]
+                    lang, conf, scores = predict_cache[variant]
                 else:
                     result = predict_language_with_confidence(variant, *model_args)
                     if result is None:
-                        lang, conf = None, 0.0
+                        lang, conf, scores = None, 0.0, [0.0, 0.0, 0.0, 0.0]
                     else:
-                        lang, conf = result.language, result.confidence
-                    predict_cache[variant] = (lang, conf)
+                        lang, conf, scores = result.language, result.confidence, result.scores
+                    predict_cache[variant] = (lang, conf, scores)
+
+                # Hebrew script coverage gate (→he pairs only)
+                if (he_virtual_conf > 0.0 and current_lang != "he"):
+                    cov = hebrew_script_coverage(variant)
+                    if cov >= he_cov_thresh:
+                        onnx_contradicts = (lang is not None and lang != "he" and conf > 0.80)
+                        if not onnx_contradicts:
+                            vc = cov * he_virtual_conf
+                            if vc > he_script_vc:
+                                he_script_vc = vc
 
                 if conf > best_conf:
-                    best_lang, best_conf = lang, conf
+                    best_lang, best_conf, best_scores = lang, conf, scores
+
+            # Apply Hebrew script gate if it beats ONNX
+            script_fired = False
+            if he_script_vc > best_conf:
+                best_lang, best_conf = "he", he_script_vc
+                best_scores = [0.0, 0.0, 0.0, 0.0]
+                script_fired = True
 
             if not best_lang:
                 continue
+
+            # Runner-up / margin from softmax scores
+            runner_up = 0.0
+            for i in (1, 2, 3):
+                if _CLASS_LANG[i] == best_lang:
+                    continue
+                if best_scores[i] > runner_up:
+                    runner_up = best_scores[i]
+            margin = best_conf - runner_up
+
+            required = required_confidence(n, params, is_phrase)
+            if required > 1.0:
+                continue
+
+            # Short-input extra confidence (FP guard)
+            if (n <= early_min + 2) and (not is_phrase) and short_extra > 0.0:
+                required = min(0.9999, required + short_extra)
 
             if best_lang == last_lang:
                 streak += 1
             else:
                 last_lang = best_lang
                 streak = 1
+
+            # Margin gate (skip when script gate fired — no real scores)
+            if (not script_fired) and margin_min > 0.0 and margin < margin_min:
+                continue
 
             if (
                 streak >= agreement_count

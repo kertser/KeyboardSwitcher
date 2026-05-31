@@ -94,6 +94,14 @@ const std::unordered_map<wchar_t, wchar_t>& GetCachedConversionMap(
     const std::wstring& sourceLayout, const std::wstring& targetLayout);
 
 // ============================================================
+// Hebrew script coverage helper (ported from 1.3.0)
+// ============================================================
+// Returns the fraction of alpha characters in `text` that fall in the
+// Hebrew Unicode block (U+05D0–U+05EA).  Spaces and non-alpha chars are
+// ignored.  Used by the Hebrew Script Coverage gate in TypoResilientDetect.
+float ComputeHebrewScriptCoverage(const std::wstring& text);
+
+// ============================================================
 // Typo-resilient detection wrapper
 // ============================================================
 // Runs detection across all layout variants, applies:
