@@ -77,6 +77,27 @@ namespace Config {
     extern bool  EnableTypoResilience;
 
     // ================================================================
+    // Case-signal Hebrew exclusion (Iteration 5 — A)
+    // ================================================================
+    // Hebrew has no upper/lowercase. When the cached text contains
+    // enough Shift/CapsLock intent (ALL-CAPS abbreviations like "FPS",
+    // or internal capitals like "iPhone") it is almost certain the text
+    // is NOT Hebrew. These flags enable a lightweight pre-filter that
+    // adds "he" to the exclusion set before running inference.
+    //
+    //  EnableCaseBasedHeExclusion — master toggle (default: true)
+    //  CaseExclusionMinCaps       — exclude Hebrew when UpperCount reaches
+    //                               this many alpha chars with shift intent
+    //                               (default: 2; "OK" → excluded, "Hi" → ok)
+    //
+    // The exclusion only removes "he" as a CANDIDATE; it does NOT skip
+    // inference altogether, and it does NOT affect the history gate.
+    // A sentence-initial capital ("Hello") never triggers exclusion because
+    // HasInternalCapital() returns false for single-leading-cap words.
+    extern bool EnableCaseBasedHeExclusion;
+    extern int  CaseExclusionMinCaps;
+
+    // ================================================================
     // New parameters (Iteration 1)
     // ================================================================
 

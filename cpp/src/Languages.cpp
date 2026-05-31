@@ -210,90 +210,6 @@ bool LanguageDetector::Load(const std::wstring& modelPath, const std::wstring& d
     }
 }
 
-std::optional<std::string> LanguageDetector::PredictLanguage(const std::wstring& text) {
-    if (!pImpl->session) return std::nullopt;
-
-    try {
-        // Tokenize: convert characters to indices
-        std::vector<int64_t> inputIndices;
-        inputIndices.reserve(MAX_LENGTH);
-
-        for (wchar_t ch : text) {
-            auto it = pImpl->charToIndex.find(ch);
-            if (it != pImpl->charToIndex.end()) {
-                inputIndices.push_back(it->second);
-            }
-        }
-
-        // ── MinKnownCharsForInference gate (Iteration 1 — A) ──────
-        // If fewer than the configured minimum characters are recognised
-        // by the model vocabulary, the input is too noisy/sparse to
-        // produce a reliable prediction.  Return nullopt early.
-        if (static_cast<int>(inputIndices.size()) < Config::MinKnownCharsForInference) {
-            ++Config::Guards.skipLowKnownChars;
-            return std::nullopt;
-        }
-
-        // Pad to MAX_LENGTH
-        while (static_cast<int>(inputIndices.size()) < MAX_LENGTH) {
-            inputIndices.push_back(0);
-        }
-        if (static_cast<int>(inputIndices.size()) > MAX_LENGTH) {
-            inputIndices.resize(MAX_LENGTH);
-        }
-
-        // Truncate if longer
-        if (static_cast<int>(inputIndices.size()) > MAX_LENGTH) {
-            inputIndices.resize(MAX_LENGTH);
-        }
-
-        // Create input tensor [1, MAX_LENGTH]
-        std::array<int64_t, 2> inputShape = {1, MAX_LENGTH};
-        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value inputTensor = Ort::Value::CreateTensor<int64_t>(
-            memoryInfo, inputIndices.data(), inputIndices.size(),
-            inputShape.data(), inputShape.size());
-
-        // Get input/output names
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputNamePtr = pImpl->session->GetInputNameAllocated(0, allocator);
-        auto outputNamePtr = pImpl->session->GetOutputNameAllocated(0, allocator);
-
-        const char* inputNames[] = {inputNamePtr.get()};
-        const char* outputNames[] = {outputNamePtr.get()};
-
-        // Run inference
-        auto outputTensors = pImpl->session->Run(
-            Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1, outputNames, 1);
-
-        // Get output
-        float* outputData = outputTensors[0].GetTensorMutableData<float>();
-        auto outputInfo = outputTensors[0].GetTensorTypeAndShapeInfo();
-        size_t outputSize = outputInfo.GetElementCount();
-
-        // Argmax
-        int predictedClass = 0;
-        float maxVal = outputData[0];
-        for (size_t i = 1; i < outputSize; ++i) {
-            if (outputData[i] > maxVal) {
-                maxVal = outputData[i];
-                predictedClass = static_cast<int>(i);
-            }
-        }
-
-        // Map class to language
-        switch (predictedClass) {
-            case 0: return std::nullopt;  // N/A
-            case 1: return "en";
-            case 2: return "he";
-            case 3: return "ru";
-            default: return std::nullopt;
-        }
-    }
-    catch (const std::exception&) {
-        return std::nullopt;
-    }
-}
 
 static std::string ClassToLanguage(int cls) {
     switch (cls) {
@@ -467,9 +383,12 @@ std::optional<DetectionResult> TypoResilientDetect(
     const std::string& currentLang,
     size_t numChars,
     DetectionHistory& history,
-    const std::set<std::string>& excludedLangs)
+    const std::set<std::string>& excludedLangs,
+    bool isFallback)
 {
-    const bool isFallback = !excludedLangs.empty();
+    // isFallback is now an explicit parameter.
+    // excludedLangs may be non-empty even on a primary (non-fallback) call
+    // (e.g. case-signal Hebrew exclusion) — history gate still applies.
 
     // --- Standard best-variant detection (same as before) ---
     std::string bestLang;

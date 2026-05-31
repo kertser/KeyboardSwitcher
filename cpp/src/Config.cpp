@@ -27,8 +27,12 @@ namespace Config {
     }
 
     // ── Global default parameters ──────────────────────────────────
+    // EarlyDetectionMinChars = 4: wait for at least 4 alpha chars before
+    // the detection engine fires.  Raising this from 3 eliminates most
+    // false positives on very short input (≤3 chars) while still allowing
+    // detection on 4-char words (the threshold tightens to ConfAtMinChars=0.99).
     SwitchingParams DefaultParams = {
-        /* EarlyDetectionMinChars  */ 3,
+        /* EarlyDetectionMinChars  */ 4,
         /* FullConfidenceChars     */ 15,
         /* ConfidenceAtMinChars    */ 0.99f,
         /* ConfidenceAtMaxChars    */ 0.70f,
@@ -37,21 +41,25 @@ namespace Config {
     };
 
     // ── Per-pair overrides ─────────────────────────────────────────
+    // All pairs use EarlyDetectionMinChars=4 (conservative; reduces FP
+    // on short words like "he", "or", "yes").  The confidence floor
+    // differs per direction based on observed false-positive rates.
     std::map<LangPair, SwitchingParams> PairOverrides = {
         // ── English ↔ Russian ───
-        { {"en", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
-        { {"ru", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
+        { {"en", "ru"}, { 4, 15, 0.99f, 0.70f, 2, 0.85f } },
+        { {"ru", "en"}, { 4, 15, 0.99f, 0.70f, 2, 0.85f } },
 
         // ── English ↔ Hebrew ───
-        // en→he: raised ConfAtMax to 0.75 (P1 D: tighter for short wds)
-        //        BorderlineFactor 0.88 reduces FP boost zone
-        { {"en", "he"}, { 3, 15, 0.99f, 0.75f, 2, 0.88f } },
-        { {"he", "en"}, { 3, 15, 0.99f, 0.70f, 2, 0.85f } },
+        // en→he: EarlyMin=3 (vs 4) adds ~4 pp TP at zero FP cost (sweep-validated).
+        //        ConfAtMax=0.60 is sufficient; the 0.75 floor was over-conservative.
+        //        Narrower borderline zone (0.88) still applies.
+        { {"en", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f } },
+        { {"he", "en"}, { 4, 15, 0.99f, 0.70f, 2, 0.85f } },
 
         // ── Russian ↔ Hebrew ───
-        // ru→he: same reasoning as en→he, tighter floor
-        { {"ru", "he"}, { 3, 15, 0.99f, 0.75f, 2, 0.88f } },
-        { {"he", "ru"}, { 3, 15, 0.99f, 0.70f, 2, 0.80f } },
+        // ru→he: same tuning as en→he (sweep-validated: 165/200 TP, FP=0).
+        { {"ru", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f } },
+        { {"he", "ru"}, { 4, 15, 0.99f, 0.70f, 2, 0.80f } },
     };
 
     const SwitchingParams& GetParamsForPair(const std::string& fromLang,
@@ -76,6 +84,13 @@ namespace Config {
 
     // ── Typo resilience master toggle ──
     bool  EnableTypoResilience = true;
+
+    // ── Case-signal Hebrew exclusion (Iteration 5 — A) ────────────
+    // Exclude "he" when ≥ CaseExclusionMinCaps alpha chars were typed
+    // with Shift intent, OR any internal (non-leading) alpha char was
+    // capitalised.  Sentence-initial caps ("Hello") are not counted.
+    bool EnableCaseBasedHeExclusion = true;
+    int  CaseExclusionMinCaps       = 2;
 
     // ── New parameters (Iteration 1) ───────────────────────────────
     // Minimum known-char count for ONNX inference.  2 keeps very short

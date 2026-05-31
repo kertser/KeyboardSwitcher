@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.2.18
+# Keyboard Switcher v1.3.1
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -40,19 +40,21 @@ native inference via ONNX Runtime.
 | **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow / navigation keys, or manual layout switch |
 | **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
-| **Per-language-pair tuning** | Each (from→to) language pair has its own confidence thresholds, min-chars, agreement count, and borderline zone — e.g. en↔ru uses standard defaults while en/ru→he uses a tighter floor (0.75) to reduce false positives |
+| **Per-language-pair tuning** | Each (from→to) pair has its own `EarlyDetectionMinChars`, `ConfidenceAtMinChars`, `ConfidenceAtMaxChars`, `ConsecutiveAgreementCount`, and `BorderlineZoneFactor`. For example, `en/ru→he` uses `EarlyMin=3` and a relaxed floor of `0.60` (sweep-validated at 84 % TP, <2 % FP on 200-word vocabulary samples) |
 | **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo) |
-| **Capitalization preservation** | If the first letter was typed with Shift the corrected text keeps the capital letter |
+| **Capitalization preservation** | Per-character: every alpha character typed with Shift intent is uppercased in the corrected text. Works for sentence-initial caps ("Hello"), CamelCase ("iPhone"), and ALL-CAPS abbreviations ("IDF"). On layouts without uppercase (Hebrew), `VkToWchar` stores the base character + shift flag; the correction path restores uppercase from the recorded `shiftState_` vector via `GetShiftStates()` |
+| **Async correction (race-free)** | The backspace + retype sequence is dispatched to a detached worker thread so the hook returns `1` immediately — the triggering key is reliably blocked even when ONNX inference takes longer than Windows' `LowLevelHooksTimeout`. Real user keystrokes are eaten by the `g_isSendingInput` guard until the worker finishes |
 
 ### Guards & noise filtering
 
-| Guard | Skip reason logged | Description |
+| Guard | Skip / log tag | Description |
 |---|---|---|
 | **URL / path filter** | `skip_url_or_path` | Skips detection for `://`, `www.`, `http`, and `X:\` drive-path patterns |
 | **Low-alpha filter** | `skip_low_alpha` | Requires at least *EarlyDetectionMinChars* real letter characters before detection runs |
 | **Low known-chars gate** | `skip_low_known_chars` | Skips ONNX inference when fewer than *MinKnownCharsForInference* (default **2**) characters appear in the model vocabulary — prevents noise or symbol-only input from reaching the model |
 | **Leaked-layout guard** | — | Rejects corrections where the source→target layout conversion would produce unmapped (leaked) characters |
 | **File-dialog protection** | `skip_file_dialog_en_protection` | When the active window is a file-open / save-as dialog (`#32770` + `DirectUIHWND` or `ComboBoxEx32`) and the current layout is English, auto-switching to Hebrew or Russian is blocked — filename entry is almost always Latin. Manual layout switches (Alt+Shift) are never affected. Controlled by **DisableAutoSwitchFromEnglishInFileDialogs** (default: on) |
+| **Case-signal Hebrew exclusion** | `EXCL: Hebrew excluded` | Hebrew has no uppercase letters. When the cached word contains ≥ *CaseExclusionMinCaps* (default **2**) alpha characters typed with Shift/CapsLock intent, **or** any internal capital (e.g. `iPhone`, `myVar`), Hebrew is removed from the candidate set before inference. Sentence-initial capitals (`"Hello"`) are **not** counted. Validated: 100 % of model Hebrew FPs on ALL-CAPS / CamelCase words eliminated; 0 real Hebrew TPs blocked |
 
 ### Hebrew-specific improvements
 
@@ -86,36 +88,52 @@ native inference via ONNX Runtime.
 The pipeline runs on every keystroke while detection is active (`SEARCH = true`):
 
 ```
-1. collect     InputCache accumulates raw keystrokes
+1. collect     InputCache accumulates raw keystrokes + per-character Shift/CapsLock state
 
 2. sanitize    Build detectionText: alpha + spaces, trimmed
                Guards: skip_url_or_path → skip_low_alpha
 
-3. variants    Generate up to 6 layout-converted variants (en↔ru↔he)
+3. case-excl   Inspect InputCache shift state:
+               if UpperCount >= CaseExclusionMinCaps  OR  HasInternalCapital:
+                   add "he" to excludedLangs           -> EXCL log tag
+               (sentence-initial capitals are ignored; Hebrew text never triggers this)
+
+4. variants    Generate source-restricted layout-conversion variants:
+               identity (text as typed on currentLang)
+               + currentLang -> each other layout  [up to 2 more variants]
+               Lossy conversions (HasLeakedLayoutChars) are skipped.
                + Hebrew final-form normalised copies of any Hebrew variant
-               Deduplicate
+               Deduplicate.
+               Restriction to currentLang-sourced conversions removes a
+               latent variant/direction mismatch and halves ONNX inferences,
+               keeping the hook well under LowLevelHooksTimeout.
 
-4. infer       TypoResilientDetect over all variants:
-                 Per variant → PredictLanguageWithConfidence
-                   → MinKnownCharsForInference gate (skip_low_known_chars)
-                   → ONNX inference (softmax, 4 classes: N/A, en, he, ru)
-                   → Hebrew sofit normalisation boost (if Hebrew chars present)
-                 Pick best-confidence language across all variants
-                 Consecutive-agreement gate  (Tier 1)
-                 Drop-one boosting in borderline zone  (Tier 2)
+5. infer       TypoResilientDetect over all variants (excludedLangs passed in):
+                 Per variant -> PredictLanguageWithConfidence
+                   -> MinKnownCharsForInference gate (skip_low_known_chars)
+                   -> ONNX inference (softmax, 4 classes: N/A, en, he, ru)
+                   -> Hebrew sofit normalisation boost (if Hebrew chars present)
+                 Skip candidates in excludedLangs
+                 Pick best-confidence language across remaining variants
+                 Consecutive-agreement gate  (Tier 1)   <- always runs, even with exclusions
+                 Drop-one boosting in borderline zone    (Tier 2)
 
-5. post-filter skip_file_dialog_en_protection  (en→he/ru in file dialogs)
+6. post-filter skip_file_dialog_en_protection  (en->he/ru in file dialogs)
                Leaked-layout guard
-               Learned-exception check → fallback detection if blocked
+               Learned-exception check -> fallback detection if blocked
+                 (fallback inherits excludedLangs, skips agreement gate)
 
-6. correct     Backspace cached text → switch layout → retype corrected text
-               Save language for this window / context
-               Record LastCorrection for Esc-undo
+7. correct     ASYNC dispatch to detached worker thread (race-free):
+                 BackspaceN-1 -> switch layout -> retype corrected text
+               Shift states from InputCache applied per-character to
+               restore original capitalisation (ALL-CAPS, CamelCase).
+               Save language for this window / context.
+               Record LastCorrection for Esc-undo.
                ++Guards.correctionsApplied
 ```
 
 `Config::Guards` counters are incremented at each guard and dumped to the debug log
-every 60 s as `GUARD-STATS: guards: emptyTok=N lowKnown=N …`.
+every 60 s as `GUARD-STATS: guards: emptyTok=N lowKnown=N ...`.
 
 ## Project Structure
 
@@ -124,10 +142,12 @@ KeyboardSwitcher/
 ├── model/                   # Model training, export & tuning (Python)
 │   ├── LangModel.ipynb      # Training notebook (PyTorch LSTM)
 │   ├── convert_to_onnx.py   # Export trained model to ONNX
-│   ├── Languages.py         # ONNX inference & layout utilities
-│   ├── Languages_torch.py   # PyTorch model class & inference
-│   ├── tune_confidence.py   # Offline confidence-threshold tuning
-│   ├── evaluate_transitions.py  # Offline validation of all language transitions
+│   ├── Languages.py         # ONNX inference & keyboard-layout conversion utilities
+│   ├── Languages_torch.py   # PyTorch model class (used during training & export)
+│   ├── tune_confidence.py   # Offline grid-search for global adaptive confidence-curve parameters
+│   ├── evaluate_transitions.py  # Per-directed-pair TP/FP validation on vocabulary
+│   ├── sweep_he_params.py   # Parameter sweep for Hebrew-target pairs
+│   ├── test_case_exclusion.py   # Validates case-signal Hebrew exclusion (ALL-CAPS, CamelCase)
 │   ├── requirements.txt
 │   ├── dictionary.json
 │   ├── dictionary.pkl
@@ -144,21 +164,29 @@ KeyboardSwitcher/
 │   ├── include/
 │   │   ├── Config.h         # Version, adaptive params, language maps,
 │   │   │                    #   MinKnownCharsForInference, file-dialog flag,
-│   │   │                    #   SkipCounters (diagnostic guards)
+│   │   │                    #   case-exclusion flags, SkipCounters (guards)
 │   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
 │   │   │                    #   GetCachedConversionMap, TypoResilientDetect
+│   │   │                    #   (excludedLangs + isFallback parameters)
 │   │   ├── FeedbackLogger.h # User exception list & learned correction overrides
-│   │   ├── InputCache.h
+│   │   ├── InputCache.h     # Per-keystroke buffer; UpperCount, HasInternalCapital,
+│   │   │                    #   GetShiftStates (per-char capitalisation restore)
 │   │   ├── WindowTracker.h
 │   │   └── TrayIcon.h
 │   ├── src/
-│   │   ├── main.cpp         # Hook, detection pipeline, IsFileDialogContext,
-│   │   │                    #   Hebrew-norm variant injection, guard counters
+│   │   ├── main.cpp         # Hook, detection pipeline, case-signal exclusion,
+│   │   │                    #   source-restricted variant generation,
+│   │   │                    #   SyncGlobalEarlyOut (startup + flyout),
+│   │   │                    #   async correction dispatch (race-free),
+│   │   │                    #   IsFileDialogContext, Hebrew-norm variant injection,
+│   │   │                    #   per-char capitalisation restore, guard counters
 │   │   ├── Config.cpp       # Params, per-pair overrides, SkipCounters impl
 │   │   ├── Languages.cpp    # ONNX inference, RunInference helper,
-│   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap
+│   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap,
+│   │   │                    #   TypoResilientDetect (isFallback decoupled);
+│   │   │                    #   PredictLanguage removed (dead code)
 │   │   ├── FeedbackLogger.cpp
-│   │   ├── InputCache.cpp
+│   │   ├── InputCache.cpp   # UpperCount, HasInternalCapital, GetShiftStates implementations
 │   │   ├── WindowTracker.cpp
 │   │   └── TrayIcon.cpp
 │   ├── resources/
@@ -192,8 +220,10 @@ Key files:
 | `convert_to_onnx.py` | Export `.pth` → `.onnx` |
 | `Languages.py` | ONNX inference & keyboard-layout conversion utilities |
 | `Languages_torch.py` | PyTorch model class (used during training & export) |
-| `tune_confidence.py` | Offline grid-search for adaptive confidence-curve parameters |
-| `evaluate_transitions.py` | Offline validation of all directed language transitions (en↔ru↔he) on vocabulary dictionaries |
+| `tune_confidence.py` | Offline grid-search for global adaptive confidence-curve parameters |
+| `evaluate_transitions.py` | Per-directed-pair TP/FP validation on vocabulary word lists (mirrors `Config::PairOverrides` and the source-restricted variant generation in `main.cpp`) |
+| `sweep_he_params.py` | Sweep `EarlyDetectionMinChars` and `ConfidenceAtMaxChars` for Hebrew-target pairs to find the TP/FP Pareto frontier |
+| `test_case_exclusion.py` | Validates the case-signal Hebrew exclusion: ALL-CAPS English/Russian + CamelCase → 100 % of model FPs eliminated, 0 real Hebrew TPs blocked |
 | `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
 ## C++ Version
@@ -248,9 +278,11 @@ Key files:
 
 ### Key configuration knobs (`Config.h` / `Config.cpp`)
 
+Global defaults (apply to any pair not listed in `PairOverrides`):
+
 | Parameter | Default | Description |
 |---|---|---|
-| `EarlyDetectionMinChars` | 3 | Global minimum alpha chars before any detection runs |
+| `EarlyDetectionMinChars` | **3** (runtime) | Global fast-path gate — set at startup by `SyncGlobalEarlyOut()` to the smallest per-pair value. Default in code is 4; runtime minimum is 3 (en/ru→he pairs). Synced on launch AND when the flyout applies settings |
 | `FullConfidenceChars` | 15 | Chars at which the confidence floor kicks in |
 | `ConfidenceAtMinChars` | 0.99 | Required confidence at *EarlyDetectionMinChars* |
 | `ConfidenceAtMaxChars` | 0.70 | Confidence floor at *FullConfidenceChars* and beyond |
@@ -259,10 +291,29 @@ Key files:
 | `MinKnownCharsForInference` | 2 | Minimum chars in the model vocabulary; below this the inference call is skipped (`skip_low_known_chars`) |
 | `DisableAutoSwitchFromEnglishInFileDialogs` | true | Block en→he/ru auto-switch when a file-open/save dialog is active |
 | `EnableTypoResilience` | true | Master toggle for consecutive-agreement and drop-one boosting |
+| `EnableCaseBasedHeExclusion` | **true** | Exclude Hebrew when the cached word has uppercase-intent characters (ALL-CAPS / CamelCase) |
+| `CaseExclusionMinCaps` | **2** | Minimum number of Shift/CapsLock alpha chars before "he" is excluded (sentence-initial caps do **not** count) |
 
-Per-pair overrides (e.g. `{"en","he"}` and `{"ru","he"}`) raise `ConfidenceAtMaxChars`
-to **0.75** and keep `BorderlineZoneFactor` at **0.88** to reduce false positives on
-pairs where one script is detected more ambiguously.
+Per-pair overrides (`Config::PairOverrides`), validated by offline sweep on 200-word vocabulary samples:
+
+| Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax | Agreement | Borderline | TP rate | FP rate |
+|---|---|---|---|---|---|---|---|---|
+| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 96.5 % | 0 % |
+| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 92.0 % | 0 % |
+| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | **84.0 %** | <1 %* |
+| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 92.5 % | 0 % |
+| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | **84.0 %** | <2 %* |
+| he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 96.5 % | 0 % |
+
+> \* Harness FP without case-exclusion guard. The C++ app additionally
+> suppresses these via `EnableCaseBasedHeExclusion` and `HasLeakedLayoutChars`,
+> so real-world FP is lower.
+> 
+> `en→he` and `ru→he` use `EarlyMin=3` (vs. 4 for other pairs): sweep showed +4–7 pp TP
+> gain. `ConfAtMax=0.60` replaces the old conservative 0.75 floor.
+> Remaining missed detections (~16 %) are model-bound.
+> All TP/FP numbers measured on the source-restricted harness (200-word vocabulary samples,
+> `evaluate_transitions.py --sample 200`).
 
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference
@@ -340,6 +391,9 @@ records every detection decision and every guard skip with its reason code:
 |---|---|
 | `DETECTION:` | Model fired — language, confidence, alpha count |
 | `CORRECT:` | Correction applied — cached text → corrected text |
+| `SENDING(async):` | Async correction worker dispatched — backspace count + target text |
+| `CAPITALIZE[N]:` | Character at position N uppercased in corrected text |
+| `EXCL:` | Language excluded from candidates (e.g. Hebrew excluded by case signal) |
 | `SKIP: skip_low_alpha` | Not enough letter characters yet |
 | `SKIP: skip_url_or_path` | URL or file-path pattern detected |
 | `SKIP: skip_low_known_chars` | Fewer than *MinKnownCharsForInference* chars in vocabulary |

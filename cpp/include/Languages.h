@@ -42,8 +42,6 @@ public:
     // Load the ONNX model and dictionary.json
     bool Load(const std::wstring& modelPath, const std::wstring& dictionaryPath);
 
-    // Predict language from text. Returns "en", "he", "ru", or nullopt
-    std::optional<std::string> PredictLanguage(const std::wstring& text);
 
     // Predict with full confidence information
     std::optional<DetectionResult> PredictLanguageWithConfidence(const std::wstring& text);
@@ -104,6 +102,17 @@ const std::unordered_map<wchar_t, wchar_t>& GetCachedConversionMap(
 // Uses per-language-pair parameters: after finding the best candidate
 // language, looks up the (currentLang → bestLang) pair params to
 // determine the required confidence threshold and other settings.
+//
+// excludedLangs — language codes (e.g. "he") to skip as candidates.
+//                 Used for case-signal exclusion (Hebrew excluded when
+//                 ALL-CAPS / internal capitals detected) and for the
+//                 user-rejection fallback path.
+//
+// isFallback    — when true, the history/consecutive-agreement gate is
+//                 skipped.  Set this only on the user-rejection retry
+//                 call, NOT on the case-exclusion primary call (the
+//                 exclusion must still honour the agreement gate).
+//
 // Returns a DetectionResult if confident enough, or nullopt.
 std::optional<DetectionResult> TypoResilientDetect(
     LanguageDetector& detector,
@@ -111,5 +120,6 @@ std::optional<DetectionResult> TypoResilientDetect(
     const std::string& currentLang,
     size_t numChars,
     DetectionHistory& history,
-    const std::set<std::string>& excludedLangs = {});
+    const std::set<std::string>& excludedLangs = {},
+    bool isFallback = false);
 

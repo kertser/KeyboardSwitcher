@@ -41,15 +41,19 @@ VOCAB_FILES = {
     "he": os.path.join(SCRIPT_DIR, "vocabulary", "hebrew_vocabulary"),
 }
 
-# Must match cpp/src/Config.cpp
-DEFAULT_PARAMS = (3, 10, 0.97, 0.55, 2, 0.85)
+# Must match cpp/src/Config.cpp  — keep in sync!
+# Format: (EarlyDetectionMinChars, FullConfidenceChars,
+#           ConfidenceAtMinChars, ConfidenceAtMaxChars,
+#           ConsecutiveAgreementCount, BorderlineZoneFactor)
+DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85)
 PAIR_OVERRIDES = {
-    ("en", "ru"): (3, 10, 0.97, 0.55, 2, 0.85),
-    ("ru", "en"): (3, 10, 0.97, 0.55, 2, 0.85),
-    ("en", "he"): (4, 12, 0.99, 0.66, 2, 0.88),
-    ("he", "en"): (4, 10, 0.98, 0.60, 2, 0.85),
-    ("ru", "he"): (4, 12, 0.99, 0.66, 2, 0.88),
-    ("he", "ru"): (4, 10, 0.98, 0.60, 2, 0.80),
+    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85),
+    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85),
+    # en→he / ru→he: EarlyMin=3 adds ~4 pp TP at zero FP cost (sweep-validated)
+    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88),
+    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85),
+    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88),
+    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80),
 }
 
 LAYOUT_PAIRS = [
@@ -103,10 +107,20 @@ def evaluate_pair(
             if required > 1.0:
                 continue
 
+            # Source-restricted variants (mirror cpp/src/main.cpp):
+            # the text was physically typed on `current_lang`'s layout, so
+            # the only meaningful interpretations are the identity (text as
+            # typed) plus current_lang -> each other layout.
             variants = []
             seen = set()
-            for src_layout, dst_layout in LAYOUT_PAIRS:
-                variant = convert_text_bidirectional(text[:n], src_layout, dst_layout)
+            cur_layout = LAYOUTS[current_lang]
+            # Identity: text exactly as typed (detects "no switch needed").
+            variants.append(text[:n])
+            seen.add(text[:n])
+            for other_lang, dst_layout in LAYOUTS.items():
+                if other_lang == current_lang:
+                    continue
+                variant = convert_text_bidirectional(text[:n], cur_layout, dst_layout)
                 if variant not in seen:
                     seen.add(variant)
                     variants.append(variant)
