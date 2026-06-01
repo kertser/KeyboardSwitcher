@@ -2260,11 +2260,15 @@ static void ApplyAllFlyoutSettings() {
 
         // Min chars from spin/edit
         if (g_fly.hSpinMinChars[i]) {
-            BOOL ok = FALSE;
+            // UDM_GETPOS32's out-BOOL reports FAILURE: TRUE = the buddy held an
+            // invalid value, FALSE = the position was read successfully. (Do NOT
+            // treat it as a success flag — that inverts the test and clobbers
+            // every pair's min-chars to 1 on every apply.)
+            BOOL failed = FALSE;
             int mc = static_cast<int>(
-                SendMessage(g_fly.hSpinMinChars[i], UDM_GETPOS32, 0, reinterpret_cast<LPARAM>(&ok)));
-            if (!ok || mc < 1) mc = 1;
-            if (mc > 15)       mc = 15;
+                SendMessage(g_fly.hSpinMinChars[i], UDM_GETPOS32, 0, reinterpret_cast<LPARAM>(&failed)));
+            if (failed || mc < 1) mc = 1;
+            if (mc > 15)          mc = 15;
             it->second.EarlyDetectionMinChars = mc;
         }
 
