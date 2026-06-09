@@ -23,6 +23,7 @@
 #include <sstream>
 #include <cstdarg>
 #include <thread>
+#include <cmath>
 
 #include <winhttp.h>
 #include <nlohmann/json.hpp>
@@ -2361,10 +2362,14 @@ static void ApplyAllFlyoutSettings() {
             it->second.EarlyDetectionMinChars = mc;
         }
 
-        // Confidence floor from slider
+        // Confidence floor from slider → routed to the calibration controller
+        // as the USER BASE.  Effective = clamp(base + delta) is applied there,
+        // so manual edits and silent adaptation no longer clobber each other.
+        // Only write on an actual change to avoid creating trivial entries.
         if (g_fly.hSliderConf[i]) {
-            it->second.ConfidenceAtMaxChars =
-                SendMessage(g_fly.hSliderConf[i], TBM_GETPOS, 0, 0) / 100.0f;
+            float v = SendMessage(g_fly.hSliderConf[i], TBM_GETPOS, 0, 0) / 100.0f;
+            if (std::fabs(v - Feedback::GetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i])) > 0.001f)
+                Feedback::SetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i], v);
         }
     }
 
@@ -2492,9 +2497,9 @@ static LRESULT CALLBACK ConfFlyoutWndProc(HWND hwnd, UINT msg,
                 hwnd, (HMENU)(INT_PTR)(IDC_SLIDER_PAIR_BASE + i), hInst, nullptr);
             SendMessage(g_fly.hSliderConf[i], TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
             {
-                auto it = Config::PairOverrides.find({PAIR_FROM[i], PAIR_TO[i]});
-                float cf = (it != Config::PairOverrides.end())
-                           ? it->second.ConfidenceAtMaxChars : 0.70f;
+                // Show the USER BASE floor, not the effective value: the
+                // invisible calibration delta must stay hidden from the UI.
+                float cf = Feedback::GetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i]);
                 int iv = static_cast<int>(cf * 100.0f + 0.5f);
                 SendMessage(g_fly.hSliderConf[i], TBM_SETPOS, TRUE, iv);
 
@@ -2568,8 +2573,14 @@ static LRESULT CALLBACK ConfFlyoutWndProc(HWND hwnd, UINT msg,
                 int defCF = static_cast<int>(ORIG_PAIR_CONF_FLOOR[i] * 100.0f + 0.5f);
                 SendMessage(g_fly.hSliderConf[i], TBM_SETPOS, TRUE, defCF);
                 UpdateConfLabel(g_fly.hLabelConf[i], defCF);
+                // Full per-pair factory reset: base → factory AND wipe any
+                // invisible calibration delta, so "Reset Defaults" is a true
+                // factory reset of the detection threshold.
+                Feedback::ResetPairToFactory(PAIR_FROM[i], PAIR_TO[i],
+                                             ORIG_PAIR_CONF_FLOOR[i]);
             }
             ApplyAllFlyoutSettings();
+            Feedback::SavePrefs();   // persist the cleared calibration state
             return 0;
         }
 
@@ -2593,6 +2604,9 @@ static LRESULT CALLBACK ConfFlyoutWndProc(HWND hwnd, UINT msg,
         return 0;
 
     case WM_DESTROY:
+        // Persist any user-base floor edits made via the sliders (SetBaseConfFloor
+        // batches writes to here so a drag does not hit the disk every tick).
+        Feedback::SavePrefs();
         g_hConfFlyout = nullptr;
         g_fly = {};
         return 0;

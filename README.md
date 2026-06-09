@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.4.1
+# Keyboard Switcher v1.4.2
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -78,7 +78,7 @@ native inference via ONNX Runtime.
 |---|---|
 | **LED state indicator** | Tray icon shows a glowing red dot while the language is undetected, switching to green once detected or manually confirmed |
 | **Dynamic tray tooltip** | Hovering the tray icon shows the current language (e.g. "Keyboard Switcher — English") |
-| **Confidence tuning** | Left-click the tray icon to adjust short / long text confidence thresholds via sliders |
+| **Confidence tuning** | Left-click the tray icon to adjust short / long text confidence thresholds via sliders. Each per-direction floor slider shows and edits the **user base** value; the invisible calibration delta rides on top and is never displayed. **Reset Defaults** restores the factory base and clears the calibration delta for every pair |
 | **System tray menu** | Right-click to enable / disable the switcher, toggle window-state saving, typo resilience, debug log, feedback collection, or exit |
 | **Debug log** | Toggle from the tray menu — timestamped entries written to `ks_debug.log` next to the exe (auto-rolls at 512 KB). All skip-reason codes are logged inline. Every 60 s a **GUARD-STATS** line reports aggregate skip-reason counters so false-positive patterns are easy to spot |
 | **Auto-update check** | On startup (with a short delay) and via _Check for Updates_ in the tray menu, the app queries the latest GitHub release; if a newer version is found it downloads the installer and runs it automatically |
@@ -355,6 +355,23 @@ Adaptation fires when `batchEvents ≥ 5` and `|ewmaFpRate − ewmaFnRate| > 0.1
 - Absolute limits applied after base+delta: conf ∈ [0.50, 0.995], margin ∈ [0.005, 0.25]
 - When the tighten ceiling is reached, `ewmaFpRate` is damped by ×0.70 to prevent permanent lock-up
 - State persisted in `user_prefs.json`; invalidated (reset to factory) on application version change
+
+#### Base vs. delta (settings-panel separation)
+
+The effective confidence floor a pair uses is `effective = clamp(userBase + calibrationDelta)`.
+The two layers are kept strictly separate so manual edits and silent adaptation never
+clobber each other:
+
+- The **Detection Settings** flyout edits and displays only the **user base**
+  (`Feedback::GetBaseConfFloor` / `SetBaseConfFloor`). The invisible calibration delta is
+  never shown — adaptation stays hidden — and rides on top of whatever base the user sets.
+- The controller stores `baseConfAtMax` (the user/factory base) and `deltaConfAtMax`
+  (the adaptive offset) independently; moving the slider shifts the base while the delta is
+  preserved, and a calibration step shifts the delta while the base is preserved.
+- **Reset Defaults** in the flyout (`Feedback::ResetPairToFactory`) restores the base to the
+  factory floor **and** zeroes the calibration delta for every pair — a true factory reset of
+  the detection thresholds. The tray *Reset Learned Exceptions & Calibration* does the same
+  globally plus clears exceptions/overrides.
 
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference

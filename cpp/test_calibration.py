@@ -16,6 +16,10 @@ using the same constants.  Verifies:
  10. ResetCalibration restores base values
  11. TP signal drives both EWMA rates toward 0
  12. Base values stored once and not overwritten on subsequent calls
+ 13–16. Reset, reversal, exact first step, per-pair isolation
+ 17. Settings flyout shows the user base, not the effective value (delta hidden)
+ 18. Manual base edit preserves the invisible calibration delta
+ 19. Reset Defaults wipes both the base edit and the calibration delta
 """
 from __future__ import annotations
 import sys, math
@@ -98,6 +102,35 @@ class PairCalibration:
 
         self.batch_events = 0
         return True
+
+    # ── Settings-flyout integration (mirrors FeedbackLogger.cpp) ──────────
+    def _apply_effective(self):
+        """Mirror of ApplyEffective(): effective = clamp(base + delta)."""
+        self.applied_conf   = max(ABS_MIN_CONF,   min(ABS_MAX_CONF,
+                                  self.base_conf_max + self.delta_conf_max))
+        self.applied_margin = max(ABS_MIN_MARGIN, min(ABS_MAX_MARGIN,
+                                  self.base_margin   + self.delta_margin))
+
+    def get_base_conf(self) -> float:
+        """Mirror of GetBaseConfFloor(): returns the USER BASE, not effective."""
+        return self.base_conf_max
+
+    def set_base_conf(self, conf_floor: float):
+        """Mirror of SetBaseConfFloor(): shift base, re-apply effective,
+        preserving any existing calibration delta."""
+        self.base_conf_max = conf_floor
+        self._apply_effective()
+
+    def reset_to_factory(self, factory_conf: float, factory_margin: float):
+        """Mirror of ResetPairToFactory(): base→factory, all deltas→0."""
+        self.base_conf_max  = factory_conf
+        self.base_margin    = factory_margin
+        self.delta_conf_max = 0.0
+        self.delta_margin   = 0.0
+        self.ewma_fp        = 0.0
+        self.ewma_fn        = 0.0
+        self.batch_events   = 0
+        self._apply_effective()
 
 
 # ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -421,6 +454,69 @@ def test_per_pair_isolation():
     check("ru→en still at factory", approx(cal_ru_en.applied_conf, 0.70) and
                                      approx(cal_ru_en.applied_margin, 0.05))
 
+# ─── Test 17: Flyout slider shows base, not effective ────────────────────────
+
+def test_base_hidden_from_ui():
+    print("\n[17] GetBaseConfFloor returns base, calibration delta stays hidden")
+    cal = PairCalibration(BASE_CONF_EN_RU, BASE_MARGIN_EN_RU)
+    # Calibration tightens the effective value behind the scenes.
+    for _ in range(20):
+        cal.record_outcome("FP")
+    check("effective conf tightened above base",
+          cal.applied_conf > BASE_CONF_EN_RU,
+          f"applied={cal.applied_conf:.4f}")
+    check("GetBaseConfFloor still reports the factory base (delta invisible)",
+          approx(cal.get_base_conf(), BASE_CONF_EN_RU),
+          f"base={cal.get_base_conf():.4f}")
+
+# ─── Test 18: Manual base edit preserves calibration delta ───────────────────
+
+def test_set_base_preserves_delta():
+    print("\n[18] SetBaseConfFloor shifts base while keeping the calibration delta")
+    cal = PairCalibration(BASE_CONF_EN_RU, BASE_MARGIN_EN_RU)
+    # Build up a tightening delta.
+    for _ in range(20):
+        cal.record_outcome("FP")
+    delta_before = cal.delta_conf_max
+    check("a positive delta exists before manual edit", delta_before > 0.0)
+    # User drags the slider to a new base (e.g. 0.65).
+    new_base = 0.65
+    cal.set_base_conf(new_base)
+    check("base updated to user value",
+          approx(cal.get_base_conf(), new_base))
+    check("calibration delta preserved across manual edit",
+          approx(cal.delta_conf_max, delta_before),
+          f"delta={cal.delta_conf_max:.4f} before={delta_before:.4f}")
+    check("effective = clamp(new_base + delta) rides on top of the edit",
+          approx(cal.applied_conf,
+                 clamp(new_base + delta_before, ABS_MIN_CONF, ABS_MAX_CONF)),
+          f"applied={cal.applied_conf:.4f}")
+
+# ─── Test 19: Reset Defaults clears base AND delta to factory ─────────────────
+
+def test_reset_pair_to_factory():
+    print("\n[19] ResetPairToFactory wipes both base edits and calibration delta")
+    cal = PairCalibration(BASE_CONF_EN_RU, BASE_MARGIN_EN_RU)
+    # Manual edit + calibration delta both present.
+    cal.set_base_conf(0.62)
+    for _ in range(20):
+        cal.record_outcome("FP")
+    check("state diverged from factory before reset",
+          (not approx(cal.get_base_conf(), BASE_CONF_EN_RU)) or
+          cal.delta_conf_max != 0.0)
+    # "Reset Defaults" button.
+    cal.reset_to_factory(BASE_CONF_EN_RU, BASE_MARGIN_EN_RU)
+    check("base restored to factory",
+          approx(cal.get_base_conf(), BASE_CONF_EN_RU))
+    check("delta_conf_max cleared", approx(cal.delta_conf_max, 0.0))
+    check("delta_margin cleared",   approx(cal.delta_margin, 0.0))
+    check("effective conf back to factory",
+          approx(cal.applied_conf, BASE_CONF_EN_RU),
+          f"applied={cal.applied_conf:.4f}")
+    check("effective margin back to factory",
+          approx(cal.applied_margin, BASE_MARGIN_EN_RU),
+          f"applied={cal.applied_margin:.4f}")
+
 # ─── Run all tests ────────────────────────────────────────────────────────────
 
 def main():
@@ -447,6 +543,10 @@ def main():
     test_reversal()
     test_exact_first_adaptation()
     test_per_pair_isolation()
+
+    test_base_hidden_from_ui()
+    test_set_base_preserves_delta()
+    test_reset_pair_to_factory()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed  "

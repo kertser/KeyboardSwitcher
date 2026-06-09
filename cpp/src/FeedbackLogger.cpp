@@ -89,6 +89,18 @@ static constexpr float CALIB_ABS_MAX_CONF      = 0.995f;
 static constexpr float CALIB_ABS_MIN_MARGIN    = 0.005f;
 static constexpr float CALIB_ABS_MAX_MARGIN    = 0.25f;
 
+// Compute effective = clamp(base + delta) for a calibrated pair and push it
+// into Config::PairOverrides.  Single source of truth for the base→effective
+// mapping, shared by the controller, persistence reload, and the flyout API.
+static void ApplyEffective(const std::string& from, const std::string& to,
+                           const PairCalibration& cal) {
+    float effConf = std::clamp(cal.baseConfAtMax + cal.deltaConfAtMax,
+                               CALIB_ABS_MIN_CONF, CALIB_ABS_MAX_CONF);
+    float effMarg = std::clamp(cal.baseMargin + cal.deltaMargin,
+                               CALIB_ABS_MIN_MARGIN, CALIB_ABS_MAX_MARGIN);
+    Config::ApplyAdaptedParams(from, to, effConf, effMarg);
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 
 // Narrow → wide
@@ -212,11 +224,7 @@ static void LoadPrefs() {
                     g_calibration[{from, to}] = cal;
                     // Re-apply effective params so Config reflects the
                     // previously computed calibration deltas immediately.
-                    float effConf = std::clamp(cal.baseConfAtMax + cal.deltaConfAtMax,
-                                               CALIB_ABS_MIN_CONF, CALIB_ABS_MAX_CONF);
-                    float effMarg = std::clamp(cal.baseMargin + cal.deltaMargin,
-                                               CALIB_ABS_MIN_MARGIN, CALIB_ABS_MAX_MARGIN);
-                    Config::ApplyAdaptedParams(from, to, effConf, effMarg);
+                    ApplyEffective(from, to, cal);
                 }
             }
         }
@@ -352,12 +360,7 @@ void RecordOutcome(const std::string& fromLang, const std::string& toLang,
 
     // Effective value = base + delta, further constrained by absolute limits
     // so a bad base (hypothetical) can never produce an insane threshold.
-    float effConf = std::clamp(cal.baseConfAtMax + cal.deltaConfAtMax,
-                               CALIB_ABS_MIN_CONF, CALIB_ABS_MAX_CONF);
-    float effMarg = std::clamp(cal.baseMargin + cal.deltaMargin,
-                               CALIB_ABS_MIN_MARGIN, CALIB_ABS_MAX_MARGIN);
-
-    Config::ApplyAdaptedParams(fromLang, toLang, effConf, effMarg);
+    ApplyEffective(fromLang, toLang, cal);
 
     // Safety: if the delta is pinned at the tightening ceiling while FP
     // pressure persists, the pair is intrinsically ambiguous for this user.
@@ -383,6 +386,50 @@ void ResetCalibration() {
     }
     g_calibration.clear();
     SavePrefs();
+}
+
+// ── Settings-flyout integration (user base vs. calibration delta) ─────
+
+float GetBaseConfFloor(const std::string& from, const std::string& to) {
+    auto it = g_calibration.find({from, to});
+    if (it != g_calibration.end() && it->second.baseLoaded)
+        return it->second.baseConfAtMax;
+    // Never calibrated/edited → the current Config value IS the factory base
+    // (delta is zero), so it doubles as the user base.
+    return Config::GetParamsForPair(from, to).ConfidenceAtMaxChars;
+}
+
+void SetBaseConfFloor(const std::string& from, const std::string& to,
+                      float confFloor) {
+    if (from.empty() || to.empty() || from == to) return;
+
+    auto& cal = g_calibration[{from, to}];
+    if (!cal.baseLoaded) {
+        // First touch: snapshot the factory margin base so any future margin
+        // calibration builds on the correct baseline.  Deltas start at zero.
+        cal.baseMargin = Config::GetParamsForPair(from, to).MinTop1Top2Margin;
+        cal.baseLoaded = true;
+    }
+    cal.baseConfAtMax = confFloor;
+    // Re-apply effective = clamp(base + delta): a manual edit shifts the base
+    // while any invisible calibration delta keeps riding on top.
+    ApplyEffective(from, to, cal);
+    // Persistence is batched by the caller (flyout close / reset handler) so a
+    // slider drag does not hammer the disk on every WM_HSCROLL tick.
+}
+
+void ResetPairToFactory(const std::string& from, const std::string& to,
+                        float factoryConfFloor) {
+    auto it = g_calibration.find({from, to});
+    // The stored baseMargin is the factory margin (calibration only ever moves
+    // the delta), so reuse it instead of duplicating the factory margin table.
+    float factoryMargin = (it != g_calibration.end() && it->second.baseLoaded)
+                          ? it->second.baseMargin
+                          : Config::GetParamsForPair(from, to).MinTop1Top2Margin;
+    // Drop all adaptive state for the pair, then write pure factory params.
+    if (it != g_calibration.end())
+        g_calibration.erase(it);
+    Config::ApplyAdaptedParams(from, to, factoryConfFloor, factoryMargin);
 }
 
 void LogEvent(const Entry& entry) {

@@ -124,5 +124,33 @@ namespace Feedback {
     // Zero out all per-pair calibration deltas and restore factory params.
     void ResetCalibration();
 
+    // ================================================================
+    // Settings-flyout integration (user base vs. invisible calibration delta)
+    // ================================================================
+    // The detection-settings flyout edits the USER BASE confidence floor for
+    // a pair.  The calibration controller keeps an invisible delta on top, and
+    // detection uses effective = clamp(base + delta).  Keeping the two concerns
+    // separate means manual edits and silent adaptation no longer clobber each
+    // other: the slider always shows the user's own setting, while calibration
+    // rides on top of it.
+
+    // Value the flyout slider should display: the user/manual base floor
+    // (calibration delta excluded).  Falls back to the factory value when the
+    // pair was never calibrated or manually edited.
+    float GetBaseConfFloor(const std::string& fromLang, const std::string& toLang);
+
+    // Set the user/manual base floor (slider moved).  Re-applies the effective
+    // value = clamp(base + delta) into Config, preserving any calibration delta.
+    // Does not persist by itself — the caller batches SavePrefs() (e.g. on
+    // flyout close) to avoid a disk write on every slider tick.
+    void SetBaseConfFloor(const std::string& fromLang, const std::string& toLang,
+                          float confFloor);
+
+    // Reset one pair to factory: base = factoryConfFloor, all deltas = 0,
+    // and re-apply factory params into Config.  Used by the flyout
+    // "Reset Defaults" button.  Does not persist by itself.
+    void ResetPairToFactory(const std::string& fromLang, const std::string& toLang,
+                            float factoryConfFloor);
+
 }  // namespace Feedback
 
