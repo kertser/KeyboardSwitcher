@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.3.3
+# Keyboard Switcher v1.4.0
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -41,6 +41,7 @@ native inference via ONNX Runtime.
 | **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) pair has its own `EarlyDetectionMinChars`, `ConfidenceAtMinChars`, `ConfidenceAtMaxChars`, `ConsecutiveAgreementCount`, and `BorderlineZoneFactor`. For example, `en/ru→he` uses `EarlyMin=3` and a relaxed floor of `0.60` (sweep-validated at 84 % TP, <2 % FP on 200-word vocabulary samples) |
+| **Adaptive calibration** | Silently tunes per-pair `ConfidenceAtMaxChars` and `MinTop1Top2Margin` based on real usage. Rejected corrections and manual overrides signal "too aggressive"; accepted corrections (no undo within 10 s) signal "just right"; unprompted manual switches signal "too strict". An EWMA controller (α=0.2, min 5 events per batch, hysteresis band 0.15) steps thresholds by ≤ 0.01 / 0.005 per adaptation with asymmetric clamps — tightening up to +0.10 / +0.08, loosening limited to −0.05 / −0.01 relative to the factory baseline. State is persisted in `user_prefs.json` alongside exceptions, invalidated on version change, and reset via the tray menu. Fully invisible: no UI changes, adaptation noted only in the debug log |
 | **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo) |
 | **Capitalization preservation** | Per-character: every alpha character typed with Shift intent is uppercased in the corrected text. Works for sentence-initial caps ("Hello"), CamelCase ("iPhone"), and ALL-CAPS abbreviations ("IDF"). On layouts without uppercase (Hebrew), `VkToWchar` stores the base character + shift flag; the correction path restores uppercase from the recorded `shiftState_` vector via `GetShiftStates()` |
 | **Async correction (race-free)** | The backspace + retype sequence is dispatched to a detached worker thread so the hook returns `1` immediately — the triggering key is reliably blocked even when ONNX inference takes longer than Windows' `LowLevelHooksTimeout`. Real user keystrokes are eaten by the `g_isSendingInput` guard until the worker finishes |
@@ -117,6 +118,7 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                  Pick best-confidence language across remaining variants
                  Consecutive-agreement gate  (Tier 1)   <- always runs, even with exclusions
                  Drop-one boosting in borderline zone    (Tier 2)
+                 Thresholds read from live-calibrated PairOverrides entry
 
 6. post-filter skip_file_dialog_en_protection  (en->he/ru in file dialogs)
                Leaked-layout guard
@@ -130,6 +132,14 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                Save language for this window / context.
                Record LastCorrection for Esc-undo.
                ++Guards.correctionsApplied
+
+8. feedback    Outcome signals routed to adaptive calibration controller:
+               FP  <- Esc-undo or manual layout override within 10 s of correction
+               TP  <- correction window expires with no rejection (context change,
+                      nav key, Enter, or buffer overflow after 10 s)
+               FN  <- unprompted manual layout switch (no recent correction)
+               Controller updates per-pair EWMA; adapts ConfidenceAtMaxChars and
+               MinTop1Top2Margin when batch >= 5 events and |pressure| > 0.15
 ```
 
 `Config::Guards` counters are incremented at each guard and dumped to the debug log
@@ -158,17 +168,21 @@ KeyboardSwitcher/
 ├── cpp/                     # C++ (Win32) production app
 │   ├── CMakeLists.txt
 │   ├── build_release.bat    # One-click release build & package script
+│   ├── test_calibration.py  # Unit tests for the adaptive calibration controller
 │   ├── lang_model.onnx
 │   ├── dictionary.json
 │   ├── keyboard.ico
 │   ├── include/
 │   │   ├── Config.h         # Version, adaptive params, language maps,
 │   │   │                    #   MinKnownCharsForInference, file-dialog flag,
-│   │   │                    #   case-exclusion flags, SkipCounters (guards)
+│   │   │                    #   case-exclusion flags, SkipCounters (guards),
+│   │   │                    #   ApplyAdaptedParams (calibration sink)
 │   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
 │   │   │                    #   GetCachedConversionMap, TypoResilientDetect
 │   │   │                    #   (excludedLangs + isFallback parameters)
-│   │   ├── FeedbackLogger.h # User exception list & learned correction overrides
+│   │   ├── FeedbackLogger.h # User exception list, learned correction overrides,
+│   │   │                    #   adaptive calibration (Outcome enum,
+│   │   │                    #   RecordOutcome, ResetCalibration)
 │   │   ├── InputCache.h     # Per-keystroke buffer; UpperCount, HasInternalCapital,
 │   │   │                    #   GetShiftStates (per-char capitalisation restore)
 │   │   ├── WindowTracker.h
@@ -179,13 +193,17 @@ KeyboardSwitcher/
 │   │   │                    #   SyncGlobalEarlyOut (startup + flyout),
 │   │   │                    #   async correction dispatch (race-free),
 │   │   │                    #   IsFileDialogContext, Hebrew-norm variant injection,
-│   │   │                    #   per-char capitalisation restore, guard counters
-│   │   ├── Config.cpp       # Params, per-pair overrides, SkipCounters impl
+│   │   │                    #   per-char capitalisation restore, guard counters,
+│   │   │                    #   MaybeConfirmTP + calibration signal wiring
+│   │   ├── Config.cpp       # Params, per-pair overrides, SkipCounters impl,
+│   │   │                    #   ApplyAdaptedParams (live calibration sink)
 │   │   ├── Languages.cpp    # ONNX inference, RunInference helper,
 │   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap,
 │   │   │                    #   TypoResilientDetect (isFallback decoupled);
 │   │   │                    #   PredictLanguage removed (dead code)
-│   │   ├── FeedbackLogger.cpp
+│   │   ├── FeedbackLogger.cpp  # EWMA calibration controller, PairCalibration
+│   │   │                    #   state machine, exceptions, overrides,
+│   │   │                    #   user_prefs.json persistence
 │   │   ├── InputCache.cpp   # UpperCount, HasInternalCapital, GetShiftStates implementations
 │   │   ├── WindowTracker.cpp
 │   │   └── TrayIcon.cpp
@@ -285,35 +303,58 @@ Global defaults (apply to any pair not listed in `PairOverrides`):
 | `EarlyDetectionMinChars` | **3** (runtime) | Global fast-path gate — set at startup by `SyncGlobalEarlyOut()` to the smallest per-pair value. Default in code is 4; runtime minimum is 3 (en/ru→he pairs). Synced on launch AND when the flyout applies settings |
 | `FullConfidenceChars` | 15 | Chars at which the confidence floor kicks in |
 | `ConfidenceAtMinChars` | 0.99 | Required confidence at *EarlyDetectionMinChars* |
-| `ConfidenceAtMaxChars` | 0.70 | Confidence floor at *FullConfidenceChars* and beyond |
+| `ConfidenceAtMaxChars` | 0.70 | Confidence floor at *FullConfidenceChars* and beyond — **live-adjusted** per pair by the calibration controller |
 | `ConsecutiveAgreementCount` | 2 | Consecutive keystrokes that must agree before switching |
 | `BorderlineZoneFactor` | 0.85 | Drop-one boosting fires in `[threshold × factor, threshold]` |
+| `MinTop1Top2Margin` | 0.05 | Required gap between top-1 and top-2 softmax probabilities — **live-adjusted** per pair by the calibration controller |
 | `MinKnownCharsForInference` | 2 | Minimum chars in the model vocabulary; below this the inference call is skipped (`skip_low_known_chars`) |
 | `DisableAutoSwitchFromEnglishInFileDialogs` | true | Block en→he/ru auto-switch when a file-open/save dialog is active |
 | `EnableTypoResilience` | true | Master toggle for consecutive-agreement and drop-one boosting |
 | `EnableCaseBasedHeExclusion` | **true** | Exclude Hebrew when the cached word has uppercase-intent characters (ALL-CAPS / CamelCase) |
 | `CaseExclusionMinCaps` | **2** | Minimum number of Shift/CapsLock alpha chars before "he" is excluded (sentence-initial caps do **not** count) |
 
-Per-pair overrides (`Config::PairOverrides`), validated by offline sweep on 200-word vocabulary samples:
+Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, validated by offline sweep on 200-word vocabulary samples. `ConfidenceAtMaxChars` and `MinTop1Top2Margin` are the live targets of the adaptive calibration controller (the factory values are stored as baselines; the controller applies a bounded delta on top):
 
-| Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax | Agreement | Borderline | TP rate | FP rate |
-|---|---|---|---|---|---|---|---|---|
-| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 96.5 % | 0 % |
-| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 92.0 % | 0 % |
-| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | **84.0 %** | <1 %* |
-| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 92.5 % | 0 % |
-| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | **84.0 %** | <2 %* |
-| he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 96.5 % | 0 % |
+| Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax ¹ | Agreement | Borderline | Margin ¹ | TP rate | FP rate |
+|---|---|---|---|---|---|---|---|---|---|
+| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 96.5 % | 0 % |
+| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 92.0 % | 0 % |
+| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **84.0 %** | <1 %* |
+| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 92.5 % | 0 % |
+| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **84.0 %** | <2 %* |
+| he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 0.05 | 96.5 % | 0 % |
 
+> ¹ Factory (baseline) values. At runtime the calibration controller can raise `ConfAtMax` by up to +0.10 and `Margin` by up to +0.08 (too many FPs), or lower them by up to −0.05 / −0.01 (too many missed detections). Calibrated deltas are persisted in `%APPDATA%\KeyboardSwitcher\user_prefs.json`.
+>
 > \* Harness FP without case-exclusion guard. The C++ app additionally
 > suppresses these via `EnableCaseBasedHeExclusion` and `HasLeakedLayoutChars`,
 > so real-world FP is lower.
-> 
+>
 > `en→he` and `ru→he` use `EarlyMin=3` (vs. 4 for other pairs): sweep showed +4–7 pp TP
 > gain. `ConfAtMax=0.60` replaces the old conservative 0.75 floor.
 > Remaining missed detections (~16 %) are model-bound.
 > All TP/FP numbers measured on the source-restricted harness (200-word vocabulary samples,
 > `evaluate_transitions.py --sample 200`).
+
+### Adaptive calibration internals
+
+The controller lives entirely in `FeedbackLogger.cpp` and runs on the main hook thread.
+No UI is involved; the only observable effect is the updated thresholds and a `CALIB:` line
+in the debug log when an adaptation step fires.
+
+| Signal | Source | Effect on EWMA |
+|---|---|---|
+| **FalsePositive** | Esc-undo, manual override within 10 s of correction | `ewmaFpRate` ← α·1 + (1−α)·ewmaFpRate |
+| **TruePositive** | No rejection within 10 s (`MaybeConfirmTP`) | both rates ← α·0 + (1−α)·rate |
+| **FalseNegative** | Unprompted manual switch (no recent correction) | `ewmaFnRate` ← α·1 + (1−α)·ewmaFnRate |
+
+Adaptation fires when `batchEvents ≥ 5` and `|ewmaFpRate − ewmaFnRate| > 0.15`:
+
+- **Tighten** (pressure > 0): `ConfAtMax += 0.01`, `Margin += 0.005`; delta clamped to `[0, +0.10]` / `[0, +0.08]`
+- **Loosen** (pressure < 0): `ConfAtMax −= 0.01`, `Margin −= 0.005`; delta clamped to `[−0.05, 0]` / `[−0.01, 0]`
+- Absolute limits applied after base+delta: conf ∈ [0.50, 0.995], margin ∈ [0.005, 0.25]
+- When the tighten ceiling is reached, `ewmaFpRate` is damped by ×0.70 to prevent permanent lock-up
+- State persisted in `user_prefs.json`; invalidated (reset to factory) on application version change
 
 ### Dependencies
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime) — ONNX model inference
@@ -376,7 +417,7 @@ and the build is reproducible from this repository.
    - Toggle typo resilience
    - Toggle debug log (`ks_debug.log` next to the exe)
    - Toggle feedback collection
-   - Reset learned exceptions
+   - Reset learned exceptions & calibration (clears per-word exceptions, learned overrides, and adaptive calibration deltas — factory thresholds restored)
    - Check for updates
    - Exit
 7. Hover the tray icon to see the current keyboard layout.
@@ -403,6 +444,27 @@ records every detection decision and every guard skip with its reason code:
 | `UNDO:` | Esc-undo reverting a correction |
 | `MANUAL-SWITCH:` | User switched layout manually |
 | `RESTORE-LANG:` | Per-window saved language restored on focus change |
+| `CALIB: tp_confirmed` | Accepted auto-correction counted as true positive; pair EWMA updated |
+| `CALIB: fn_manual_switch` | Unprompted manual layout switch counted as missed detection; pair EWMA updated |
+
+### Persistent user data
+
+All learned state is stored in `%APPDATA%\KeyboardSwitcher\`:
+
+| File | Contents |
+|---|---|
+| `user_prefs.json` | Per-word exceptions, learned correction overrides, adaptive calibration deltas (EWMA state + current delta per pair), logging preference |
+| `feedback.jsonl` | Timestamped feedback event log (only written when _Feedback collection_ is enabled) |
+
+The calibration block in `user_prefs.json` looks like:
+```json
+"calibration": {
+  "en>ru": { "ewma_fp": 0.08, "ewma_fn": 0.0, "delta_conf_max": 0.01,
+             "delta_margin": 0.005, "base_conf_max": 0.70, "base_margin": 0.05,
+             "batch_events": 2 }
+}
+```
+This file is safe to delete — the app recreates it with factory defaults on next launch.
 
 ## Contributing
 

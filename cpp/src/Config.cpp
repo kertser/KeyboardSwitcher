@@ -108,6 +108,23 @@ namespace Config {
         return DefaultParams.GetRequiredConfidence(numChars);
     }
 
+    void ApplyAdaptedParams(const std::string& fromLang, const std::string& toLang,
+                            float confAtMax, float margin) {
+        auto it = PairOverrides.find({fromLang, toLang});
+        if (it != PairOverrides.end()) {
+            it->second.ConfidenceAtMaxChars = confAtMax;
+            it->second.MinTop1Top2Margin    = margin;
+        } else {
+            // Insert a full-param copy of the applicable base, then override
+            // just the two calibrated fields.  This ensures the pair uses the
+            // correct per-pair values for all other parameters.
+            SwitchingParams p = DefaultParams;
+            p.ConfidenceAtMaxChars = confAtMax;
+            p.MinTop1Top2Margin    = margin;
+            PairOverrides[{fromLang, toLang}] = p;
+        }
+    }
+
     // ── Typo resilience master toggle ──
     bool  EnableTypoResilience = true;
 

@@ -102,5 +102,27 @@ namespace Feedback {
     // Get the %APPDATA%/KeyboardSwitcher directory.
     std::wstring GetDataDir();
 
+    // ================================================================
+    // Adaptive calibration
+    // ================================================================
+    // Outcome of a correction event.  Used to drive the per-pair
+    // confidence-threshold controller via an EWMA state machine.
+    enum class Outcome {
+        FalsePositive,  // auto-correction was wrong  (esc_undo / manual_override)
+        TruePositive,   // auto-correction was accepted (no rejection after window)
+        FalseNegative,  // system missed a switch — user switched manually
+    };
+
+    // Record the outcome of one correction event for (fromLang → toLang).
+    // Updates EWMA state and, once enough events accumulate with pressure
+    // exceeding the hysteresis band, adjusts ConfidenceAtMaxChars and
+    // MinTop1Top2Margin for the pair via Config::ApplyAdaptedParams.
+    // Must be called on the main hook thread only.
+    void RecordOutcome(const std::string& fromLang, const std::string& toLang,
+                       Outcome outcome);
+
+    // Zero out all per-pair calibration deltas and restore factory params.
+    void ResetCalibration();
+
 }  // namespace Feedback
 

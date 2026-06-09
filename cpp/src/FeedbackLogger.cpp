@@ -8,6 +8,8 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include <cmath>
+#include <algorithm>
 #include <set>
 #include <nlohmann/json.hpp>
 
@@ -36,6 +38,56 @@ static std::map<std::string, std::map<std::wstring, std::string>> g_overrides;
 
 static constexpr size_t MAX_FEEDBACK_BYTES = 2 * 1024 * 1024;  // 2 MB
 static constexpr size_t MAX_EXCEPTIONS_PER_LANG = 500;
+
+// ── Adaptive calibration ─────────────────────────────────────────────
+// Per-(from→to) state machine.  All values live on the main hook thread.
+struct PairCalibration {
+    // EWMA error rates (event-driven, updated on every RecordOutcome call)
+    float ewmaFpRate  = 0.0f;   // exponential MA of false-positive rate
+    float ewmaFnRate  = 0.0f;   // exponential MA of false-negative rate
+
+    // Events accumulated in the current batch (reset after each adaptation)
+    int   batchEvents = 0;
+
+    // Cumulative applied deltas relative to the factory baseline
+    float deltaConfAtMax = 0.0f;
+    float deltaMargin    = 0.0f;
+
+    // Factory baseline snapshotted once (from Config at first RecordOutcome
+    // call, or restored from user_prefs.json on subsequent sessions).
+    float baseConfAtMax = 0.0f;
+    float baseMargin    = 0.0f;
+    bool  baseLoaded    = false;
+};
+
+using PairKey = std::pair<std::string, std::string>;
+static std::map<PairKey, PairCalibration> g_calibration;
+
+// ── Controller constants ──────────────────────────────────────────────
+// EWMA decay factor per event (α=0.2 → ~5 events half-life).
+static constexpr float CALIB_EWMA_ALPHA        = 0.20f;
+// Minimum events per batch before any adaptation is attempted.
+static constexpr int   CALIB_MIN_EVENTS        = 5;
+// |pressure| must exceed this before a step is taken (dead zone).
+static constexpr float CALIB_HYSTERESIS_BAND   = 0.15f;
+// Step size per adaptation for ConfidenceAtMaxChars.
+static constexpr float CALIB_STEP_CONF         = 0.01f;
+// Step size per adaptation for MinTop1Top2Margin (half the conf step).
+static constexpr float CALIB_STEP_MARGIN       = 0.005f;
+// Maximum cumulative delta for tightening (raising thresholds).
+static constexpr float CALIB_MAX_TIGHTEN_CONF  = 0.10f;
+static constexpr float CALIB_MAX_TIGHTEN_MARG  = 0.08f;
+// Maximum cumulative delta for loosening (lowering thresholds).
+// Deliberately asymmetric: loosening is more conservative than tightening
+// because a too-permissive setting produces more visible false positives.
+static constexpr float CALIB_MAX_LOOSEN_CONF   = 0.05f;
+static constexpr float CALIB_MAX_LOOSEN_MARG   = 0.01f;
+// Absolute clamps applied after base+delta to prevent extreme values
+// regardless of how far the delta drifts.
+static constexpr float CALIB_ABS_MIN_CONF      = 0.50f;
+static constexpr float CALIB_ABS_MAX_CONF      = 0.995f;
+static constexpr float CALIB_ABS_MIN_MARGIN    = 0.005f;
+static constexpr float CALIB_ABS_MAX_MARGIN    = 0.25f;
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -136,6 +188,38 @@ static void LoadPrefs() {
                 }
             }
         }
+
+        // ── Calibration state ─────────────────────────────────────────
+        if (j.contains("calibration") && j["calibration"].is_object()) {
+            for (auto& [key, c] : j["calibration"].items()) {
+                auto sep = key.find('>');
+                if (sep == std::string::npos) continue;
+                std::string from = key.substr(0, sep);
+                std::string to   = key.substr(sep + 1);
+                if (from.empty() || to.empty()) continue;
+
+                PairCalibration cal;
+                cal.ewmaFpRate     = c.value("ewma_fp",        0.0f);
+                cal.ewmaFnRate     = c.value("ewma_fn",        0.0f);
+                cal.deltaConfAtMax = c.value("delta_conf_max", 0.0f);
+                cal.deltaMargin    = c.value("delta_margin",   0.0f);
+                cal.baseConfAtMax  = c.value("base_conf_max",  0.0f);
+                cal.baseMargin     = c.value("base_margin",    0.0f);
+                cal.batchEvents    = c.value("batch_events",   0);
+                cal.baseLoaded     = (cal.baseConfAtMax > 0.0f);
+
+                if (cal.baseLoaded) {
+                    g_calibration[{from, to}] = cal;
+                    // Re-apply effective params so Config reflects the
+                    // previously computed calibration deltas immediately.
+                    float effConf = std::clamp(cal.baseConfAtMax + cal.deltaConfAtMax,
+                                               CALIB_ABS_MIN_CONF, CALIB_ABS_MAX_CONF);
+                    float effMarg = std::clamp(cal.baseMargin + cal.deltaMargin,
+                                               CALIB_ABS_MIN_MARGIN, CALIB_ABS_MAX_MARGIN);
+                    Config::ApplyAdaptedParams(from, to, effConf, effMarg);
+                }
+            }
+        }
     } catch (...) {
         // Corrupt file — ignore
     }
@@ -168,6 +252,23 @@ void SavePrefs() {
     }
     j["overrides"] = ov;
 
+    // ── Calibration state ─────────────────────────────────────────────
+    json cal_obj = json::object();
+    for (auto& [k, cal] : g_calibration) {
+        if (!cal.baseLoaded) continue;
+        std::string key = k.first + ">" + k.second;
+        json c;
+        c["ewma_fp"]        = cal.ewmaFpRate;
+        c["ewma_fn"]        = cal.ewmaFnRate;
+        c["delta_conf_max"] = cal.deltaConfAtMax;
+        c["delta_margin"]   = cal.deltaMargin;
+        c["base_conf_max"]  = cal.baseConfAtMax;
+        c["base_margin"]    = cal.baseMargin;
+        c["batch_events"]   = cal.batchEvents;
+        cal_obj[key] = c;
+    }
+    j["calibration"] = cal_obj;
+
     std::ofstream out(g_prefsPath.c_str(), std::ios::trunc);
     if (out) out << j.dump(2);
 }
@@ -193,6 +294,95 @@ void Init() {
     g_prefsPath    = g_dataDir + L"\\user_prefs.json";
 
     LoadPrefs();
+}
+
+// ── Adaptive calibration ─────────────────────────────────────────────
+
+void RecordOutcome(const std::string& fromLang, const std::string& toLang,
+                   Outcome outcome) {
+    if (fromLang.empty() || toLang.empty() || fromLang == toLang) return;
+
+    PairKey key{fromLang, toLang};
+    auto& cal = g_calibration[key];
+
+    // Snapshot the factory baseline once (on first use in a fresh session).
+    // On subsequent sessions this is restored from user_prefs.json so we
+    // never accumulate deltas on top of already-adapted values.
+    if (!cal.baseLoaded) {
+        const auto& p = Config::GetParamsForPair(fromLang, toLang);
+        cal.baseConfAtMax = p.ConfidenceAtMaxChars;
+        cal.baseMargin    = p.MinTop1Top2Margin;
+        cal.baseLoaded    = true;
+    }
+
+    // Update EWMA: signal is 1.0 for the active outcome type, 0.0 otherwise.
+    // TruePositive drives both rates toward 0 (the model is doing its job).
+    float fpSig = (outcome == Outcome::FalsePositive) ? 1.0f : 0.0f;
+    float fnSig = (outcome == Outcome::FalseNegative) ? 1.0f : 0.0f;
+    cal.ewmaFpRate = CALIB_EWMA_ALPHA * fpSig + (1.0f - CALIB_EWMA_ALPHA) * cal.ewmaFpRate;
+    cal.ewmaFnRate = CALIB_EWMA_ALPHA * fnSig + (1.0f - CALIB_EWMA_ALPHA) * cal.ewmaFnRate;
+    ++cal.batchEvents;
+
+    // Wait for a minimum batch before attempting any adaptation.
+    if (cal.batchEvents < CALIB_MIN_EVENTS) return;
+
+    // pressure > 0  → too many FPs → tighten thresholds
+    // pressure < 0  → too many FNs → loosen thresholds
+    float pressure = cal.ewmaFpRate - cal.ewmaFnRate;
+
+    // Dead zone: absorb noise without touching params; reset the batch counter
+    // so the next MIN_EVENTS accumulate fresh signal.
+    if (std::abs(pressure) < CALIB_HYSTERESIS_BAND) {
+        cal.batchEvents = 0;
+        return;
+    }
+
+    bool tighten = (pressure > 0.0f);
+    float dConf   = tighten ?  CALIB_STEP_CONF   : -CALIB_STEP_CONF;
+    float dMargin = tighten ?  CALIB_STEP_MARGIN  : -CALIB_STEP_MARGIN;
+
+    // Clamp cumulative delta within asymmetric limits:
+    //   tightening (raising thresholds)  → delta in [0, +MAX_TIGHTEN]
+    //   loosening  (lowering thresholds) → delta in [-MAX_LOOSEN, 0]
+    // The full range is [-MAX_LOOSEN, +MAX_TIGHTEN] to allow reversal.
+    cal.deltaConfAtMax = std::clamp(cal.deltaConfAtMax + dConf,
+                                    -CALIB_MAX_LOOSEN_CONF, CALIB_MAX_TIGHTEN_CONF);
+    cal.deltaMargin    = std::clamp(cal.deltaMargin + dMargin,
+                                    -CALIB_MAX_LOOSEN_MARG, CALIB_MAX_TIGHTEN_MARG);
+
+    // Effective value = base + delta, further constrained by absolute limits
+    // so a bad base (hypothetical) can never produce an insane threshold.
+    float effConf = std::clamp(cal.baseConfAtMax + cal.deltaConfAtMax,
+                               CALIB_ABS_MIN_CONF, CALIB_ABS_MAX_CONF);
+    float effMarg = std::clamp(cal.baseMargin + cal.deltaMargin,
+                               CALIB_ABS_MIN_MARGIN, CALIB_ABS_MAX_MARGIN);
+
+    Config::ApplyAdaptedParams(fromLang, toLang, effConf, effMarg);
+
+    // Safety: if the delta is pinned at the tightening ceiling while FP
+    // pressure persists, the pair is intrinsically ambiguous for this user.
+    // Decay the EWMA so the controller does not remain locked at the ceiling
+    // forever and can recover if the user's typing patterns change.
+    if (tighten &&
+        (cal.deltaConfAtMax >= CALIB_MAX_TIGHTEN_CONF - 0.001f ||
+         cal.deltaMargin    >= CALIB_MAX_TIGHTEN_MARG - 0.001f)) {
+        cal.ewmaFpRate *= 0.70f;   // soft reset — one good TP batch will unlock
+    }
+
+    cal.batchEvents = 0;  // reset batch; EWMA memory is preserved
+
+    SavePrefs();
+}
+
+void ResetCalibration() {
+    // Restore factory params for every pair that was ever calibrated.
+    for (auto& [k, cal] : g_calibration) {
+        if (!cal.baseLoaded) continue;
+        Config::ApplyAdaptedParams(k.first, k.second,
+                                   cal.baseConfAtMax, cal.baseMargin);
+    }
+    g_calibration.clear();
+    SavePrefs();
 }
 
 void LogEvent(const Entry& entry) {
@@ -272,6 +462,15 @@ std::string GetOverride(const std::string& currentLang,
 void ResetAll() {
     g_exceptions.clear();
     g_overrides.clear();
+    // Restore factory params for every calibrated pair BEFORE clearing the
+    // calibration map, otherwise Config::PairOverrides keeps the adapted
+    // (delta-modified) thresholds in memory until the next restart.
+    for (auto& [k, cal] : g_calibration) {
+        if (!cal.baseLoaded) continue;
+        Config::ApplyAdaptedParams(k.first, k.second,
+                                   cal.baseConfAtMax, cal.baseMargin);
+    }
+    g_calibration.clear();
     DeleteFileW(g_feedbackPath.c_str());
     SavePrefs();
 }

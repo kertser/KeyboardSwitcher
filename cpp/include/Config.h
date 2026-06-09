@@ -178,4 +178,14 @@ namespace Config {
     // Get HKL from language string
     HKL GetHKLFromLanguage(const std::string& lang);
 
+    // ================================================================
+    // Adaptive calibration sink
+    // ================================================================
+    // Writes calibration-derived effective values for a language pair
+    // directly into PairOverrides (inserting a full-param entry from the
+    // applicable base if the pair is not yet present).  Called only from
+    // FeedbackLogger::RecordOutcome and ::ResetCalibration.
+    void ApplyAdaptedParams(const std::string& fromLang, const std::string& toLang,
+                            float confAtMax, float margin);
+
 } // namespace Config

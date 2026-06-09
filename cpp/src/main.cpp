@@ -971,6 +971,28 @@ static void ChangeKeyboardLayout(const std::string& lang) {
 }
 
 // ============================================================
+// Confirm a pending auto-correction as a true positive (TP).
+// Called when the rejection window expires without any esc_undo
+// or manual_override signal — the user accepted the correction.
+// g_lastCorrectionTick is zeroed after confirmation so the same
+// correction is never counted twice.
+// ============================================================
+static void MaybeConfirmTP() {
+    if (!g_lastCorrection.valid)   return;
+    if (g_lastCorrectionTick == 0) return;   // already confirmed or rejected
+    DWORD now = GetTickCount();
+    if ((now - g_lastCorrectionTick) < Feedback::SWITCH_AWAY_WINDOW_MS) return;
+    Feedback::RecordOutcome(g_lastCorrection.originalLang,
+                             g_lastCorrection.correctedLang,
+                             Feedback::Outcome::TruePositive);
+    g_lastCorrectionTick = 0;  // prevent double-counting
+    Dbg("CALIB: tp_confirmed %s→%s conf=%.3f",
+        g_lastCorrection.originalLang.c_str(),
+        g_lastCorrection.correctedLang.c_str(),
+        g_lastCorrection.confidence);
+}
+
+// ============================================================
 // Centralized focus-change handler
 // ============================================================
 // Called when the foreground window or its title (tab) changes,
@@ -1009,6 +1031,9 @@ static void HandleFocusChange(bool forceSearch = false) {
         forceSearch, g_cache.Size());
 
     if (contextChanged) {
+        // Confirm a pending TP before wiping correction state.
+        MaybeConfirmTP();
+
         // Invalidate undo — user moved to a different context
         g_lastCorrection.valid = false;
         g_pendingRejection.active = false;  // context change invalidates
@@ -1395,6 +1420,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     g_lastCorrection.correctedLang,
                     g_lastCorrection.correctedText,
                     g_lastCorrection.originalLang);
+                // ── Adaptive calibration: FP signal ──────────────────
+                Feedback::RecordOutcome(g_lastCorrection.originalLang,
+                                        g_lastCorrection.correctedLang,
+                                        Feedback::Outcome::FalsePositive);
                 Dbg("FEEDBACK: esc_undo %s->%s conf=%.3f",
                     g_lastCorrection.originalLang.c_str(),
                     g_lastCorrection.correctedLang.c_str(),
@@ -1414,6 +1443,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // --- Arrow / navigation keys break word continuity ---
     if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
         vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT) {
+        MaybeConfirmTP();
         g_cache.Clear();
         g_history.Clear();
         g_lastCorrection.valid = false;
@@ -1424,6 +1454,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (g_lastCorrection.valid && vk != VK_ESCAPE) {
         if (vk == VK_RETURN ||
             g_lastCorrection.postChars.size() >= MAX_UNDO_POST_CHARS) {
+            MaybeConfirmTP();
             g_lastCorrection.valid = false;
         }
     }
@@ -1502,6 +1533,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             windowLang.c_str(), currentLayout.c_str(),
                             g_lastForegroundHwnd, g_lastContextHash);
 
+                        // Confirm a pending TP whose 10 s window already
+                        // expired (no-op if still inside the rejection window,
+                        // so Signal 1 below still fires for genuine rejections).
+                        MaybeConfirmTP();
+
                         // ── Feedback: detect rejected correction ──
                         // Two complementary signals:
                         //
@@ -1540,6 +1576,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                                 g_lastCorrection.correctedLang,
                                 g_lastCorrection.correctedText,
                                 g_lastCorrection.originalLang);
+                            // ── Adaptive calibration: FP signal ──────────
+                            Feedback::RecordOutcome(g_lastCorrection.originalLang,
+                                                    g_lastCorrection.correctedLang,
+                                                    Feedback::Outcome::FalsePositive);
                             Dbg("FEEDBACK: switch_away %s→%s actual=%s conf=%.3f elapsed=%lums",
                                 g_lastCorrection.originalLang.c_str(),
                                 g_lastCorrection.correctedLang.c_str(),
@@ -1570,6 +1610,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                                 g_pendingRejection.toLang,
                                 g_pendingRejection.correctedText,
                                 g_pendingRejection.fromLang);
+                            // ── Adaptive calibration: FP signal ──────────
+                            Feedback::RecordOutcome(g_pendingRejection.fromLang,
+                                                    g_pendingRejection.toLang,
+                                                    Feedback::Outcome::FalsePositive);
                             Dbg("FEEDBACK: pending_rejection %s→%s actual=%s conf=%.3f",
                                 g_pendingRejection.fromLang.c_str(),
                                 g_pendingRejection.toLang.c_str(),
@@ -1578,6 +1622,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             feedbackLogged = true;
                         }
                         g_pendingRejection.active = false;
+
+                        // Pure voluntary switch (no recent correction rejected):
+                        // possible FN — the system failed to auto-switch for this pair.
+                        if (!feedbackLogged) {
+                            Feedback::RecordOutcome(windowLang, currentLayout,
+                                                    Feedback::Outcome::FalseNegative);
+                            Dbg("CALIB: fn_manual_switch %s→%s",
+                                windowLang.c_str(), currentLayout.c_str());
+                        }
 
                         // Expire any lingering grace period
                         g_lastCorrectionTick = 0;
