@@ -1861,6 +1861,18 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             // Uses per-language-pair parameters for confidence thresholds.
             // alphaCount (not cacheSize) is used as numChars so that non-alpha
             // symbols don't artificially lower the required confidence.
+            //
+            // ── Hook-timeout guard ──────────────────────────────────────────
+            // ONNX inference runs synchronously here, inside the low-level
+            // keyboard hook.  Windows has a LowLevelHooksTimeout (default
+            // ~300 ms) after which it delivers the key to the app anyway,
+            // even if the hook later returns 1.  We time the detection so
+            // that the correction thread can compensate: if inference took
+            // >= HOOK_TIMEOUT_SAFE_MS we assume the triggering key was already
+            // delivered and add one extra backspace (bsCount = cacheLen
+            // instead of cacheLen-1).
+            ULONGLONG hookDetectStartMs = GetTickCount64();
+
             auto detection = TypoResilientDetect(
                 *g_detector, textVariants, currentLangId, alphaCount, g_history,
                 caseExcludedLangs, /*isFallback=*/false);
@@ -2067,14 +2079,38 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     // hook reliably blocks the triggering key.  Real user
                     // keystrokes are eaten by the g_isSendingInput guard at
                     // the top of the hook until the worker clears it.
+                    //
+                    // ── Timeout compensation ────────────────────────────
+                    // Even with the async dispatch, the ONNX inference above
+                    // still runs synchronously in this callback.  If it took
+                    // >= HOOK_TIMEOUT_SAFE_MS (conservative, below the default
+                    // 300 ms OS LowLevelHooksTimeout), Windows may have already
+                    // delivered the triggering key to the app before we reach
+                    // `return 1`.  In that case the app has cacheLen chars on
+                    // screen (not cacheLen-1) and we must send one extra
+                    // backspace to avoid leaving a stray character.
+                    static constexpr ULONGLONG HOOK_TIMEOUT_SAFE_MS = 200;
+                    ULONGLONG detectionElapsedMs =
+                        GetTickCount64() - hookDetectStartMs;
+                    bool hookMayHaveTimedOut =
+                        (detectionElapsedMs >= HOOK_TIMEOUT_SAFE_MS);
+
                     g_isSendingInput.store(true);
 
-                    size_t       bsCount   = (cacheLen > 1) ? cacheLen - 1 : 0;
+                    // Normal path: triggering key was blocked → app has
+                    //   cacheLen-1 chars → delete cacheLen-1.
+                    // Timeout path: triggering key was delivered by OS →
+                    //   app has cacheLen chars → delete cacheLen.
+                    size_t bsCount = hookMayHaveTimedOut
+                                        ? cacheLen
+                                        : (cacheLen > 1 ? cacheLen - 1 : 0);
                     std::wstring sendText  = correctedText;
                     std::string  sendLang  = bestLang;
 
-                    Dbg("SENDING(async): backspaces=%zu text=%s",
-                        bsCount, ws2s(correctedText).c_str());
+                    Dbg("SENDING(async): backspaces=%zu text=%s elapsed=%llums%s",
+                        bsCount, ws2s(correctedText).c_str(),
+                        detectionElapsedMs,
+                        hookMayHaveTimedOut ? " [TIMEOUT-COMP]" : "");
 
                     std::thread([bsCount, sendText, sendLang]() {
                         BOOL blocked = BlockInput(TRUE);

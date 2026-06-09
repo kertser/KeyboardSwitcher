@@ -520,12 +520,24 @@ std::optional<DetectionResult> TypoResilientDetect(
     // If the confidence is close to but below the threshold, a single typo
     // character may be dragging it down.  Try removing each character once
     // and see if confidence jumps above the threshold.
+    //
+    // ── Iteration cap ───────────────────────────────────────────────────
+    // Each dropped-char call is a full ONNX inference.  Running O(N) calls
+    // inside the low-level keyboard hook risks exceeding LowLevelHooksTimeout
+    // (~300 ms), which causes Windows to deliver the triggering key to the
+    // app before the hook returns — the root cause of the "stray leading
+    // character" bug.  We cap iterations at MAX_DROP_ONE_ITERS to keep the
+    // total inference budget predictable and well under the OS timeout.
+    static constexpr int MAX_DROP_ONE_ITERS = 6;
     if (Config::EnableTypoResilience &&
         bestConf < requiredConfidence &&
         bestConf >= requiredConfidence * params.BorderlineZoneFactor &&
         bestVariant.size() > 2)
     {
+        int dropIters = 0;
         for (size_t i = 0; i < bestVariant.size(); ++i) {
+            if (dropIters >= MAX_DROP_ONE_ITERS) break;
+            ++dropIters;
             std::wstring dropped = bestVariant.substr(0, i)
                                  + bestVariant.substr(i + 1);
             auto res = detector.PredictLanguageWithConfidence(dropped);
