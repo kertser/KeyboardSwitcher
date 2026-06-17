@@ -42,22 +42,25 @@ VOCAB_FILES = {
 }
 
 # Must match cpp/src/Config.cpp  — keep in sync!
-# Format (11): (EarlyDetectionMinChars, FullConfidenceChars,
+# Format (17): (EarlyDetectionMinChars, FullConfidenceChars,
 #               ConfidenceAtMinChars, ConfidenceAtMaxChars,
 #               ConsecutiveAgreementCount, BorderlineZoneFactor,
 #               MinTop1Top2Margin, ShortInputExtraConf, PhraseConfScale,
-#               HebrewScriptVirtualConf, HebrewScriptCoverageThreshold)
-DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90)
+#               HebrewScriptVirtualConf, HebrewScriptCoverageThreshold,
+#               SwitchBiasMargin, PersistentMinAvgConf, PersistentMinSteps,
+#               WeakScoreClassIdx, WeakScoreMinAvg, WeakScoreWindow)
+DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7)
 PAIR_OVERRIDES = {
     # Margin gate: 0.05 on robust pairs (cheap FP insurance), 0.10 on →he.
-    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    # en→he / ru→he: EarlyMin=3; signal-quality gates ported from 1.3.0
-    #   margin=0.10, phraseScale=0.80, hebrewScriptVirtualConf=0.78
-    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
-    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
-    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90),
+    # SwitchBiasMargin (idx 11): incumbent guard, 0.04 on →he only (zero
+    #   harness cost), 0.0 on robust pairs.  Persistent/weak gates (PMS=6,
+    #   WSMA=0.40) restored for Hebrew flat-signal recovery with no FP cost.
+    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
 }
 
 LAYOUT_PAIRS = [
@@ -70,6 +73,10 @@ LAYOUT_PAIRS = [
 ]
 
 _CLASS_LANG = {1: "en", 2: "he", 3: "ru"}
+
+# Global detection early-out: the C++ hook only calls detection once the cache
+# reaches the smallest EarlyDetectionMinChars across all pairs.
+GLOBAL_MIN = min(p[0] for p in PAIR_OVERRIDES.values())
 
 
 def hebrew_script_coverage(text: str) -> float:
@@ -119,21 +126,55 @@ def evaluate_pair(
     model_args: list,
 ) -> Tuple[int, int, int, int]:
     params = PAIR_OVERRIDES.get((from_lang, to_lang), DEFAULT_PARAMS)
-    agreement_count = params[4]
-    early_min       = params[0]
-    margin_min      = params[6]
-    short_extra     = params[7]
     he_params       = PAIR_OVERRIDES.get((from_lang, "he"), DEFAULT_PARAMS)
     he_virtual_conf = he_params[9]
     he_cov_thresh   = he_params[10]
     # Cache: variant -> (lang, conf, scores)
     predict_cache: Dict[str, Tuple[str | None, float, list]] = {}
 
+    def _is_phrase(variants) -> bool:
+        # Any space → ≥2 words.  (Ablation showed a stricter rule costs
+        # Hebrew-phrase recall for no measurable FP gain; see exp_phrase.py.)
+        return any(" " in v for v in variants)
+
     def predict_best_lang(text: str, current_lang: str) -> str | None:
         last_lang = ""
         streak = 0
+        frames: list = []  # (lang, conf, scores), newest at end, capped at 10
+        cur_idx = next((i for i in (1, 2, 3) if _CLASS_LANG[i] == current_lang), 0)
+
+        def update(lang, conf, scores):
+            nonlocal last_lang, streak
+            if lang == last_lang:
+                streak += 1
+            else:
+                last_lang, streak = lang, 1
+            frames.append((lang, conf, list(scores)))
+            if len(frames) > 10:
+                frames.pop(0)
+
+        def is_persistent(lang, min_steps, min_avg) -> bool:
+            if min_steps <= 0 or len(frames) < min_steps:
+                return False
+            s = 0.0
+            for f in frames[-min_steps:]:
+                if f[0] != lang:
+                    return False
+                s += f[1]
+            return (s / min_steps) >= min_avg
+
+        def weak_score_avg(cls_idx, window) -> float:
+            if window <= 0 or len(frames) < window:
+                return 0.0
+            return sum(f[2][cls_idx] for f in frames[-window:]) / window
 
         for n in range(1, len(text) + 1):
+            # Global early-out: detection only runs once enough chars are typed,
+            # matching the C++ main.cpp fast-path (min EarlyDetectionMinChars
+            # across all pairs).  Below this the hook never calls detection, so
+            # the harness must not process or pre-seed history at those positions.
+            if n < GLOBAL_MIN:
+                continue
             # Source-restricted variants (mirror cpp/src/main.cpp):
             # identity (text as typed) plus current_lang -> each other layout.
             variants = []
@@ -149,11 +190,12 @@ def evaluate_pair(
                     seen.add(variant)
                     variants.append(variant)
 
-            is_phrase = any(" " in v for v in variants)
+            is_phrase = _is_phrase(variants)
 
             best_lang = None
             best_conf = 0.0
             best_scores: list = [0.0, 0.0, 0.0, 0.0]
+            incumbent_conf = 0.0
             he_script_vc = 0.0
             for variant in variants:
                 if variant in predict_cache:
@@ -176,8 +218,12 @@ def evaluate_pair(
                             if vc > he_script_vc:
                                 he_script_vc = vc
 
-                if conf > best_conf:
-                    best_lang, best_conf, best_scores = lang, conf, scores
+                if lang is not None:
+                    # Incumbent (stay-on-current-language) strength, top-2 aware.
+                    if cur_idx and scores[cur_idx] > incumbent_conf:
+                        incumbent_conf = scores[cur_idx]
+                    if conf > best_conf:
+                        best_lang, best_conf, best_scores = lang, conf, scores
 
             # Apply Hebrew script gate if it beats ONNX
             script_fired = False
@@ -187,7 +233,20 @@ def evaluate_pair(
                 script_fired = True
 
             if not best_lang:
+                update("", 0.0, [0.0, 0.0, 0.0, 0.0])
                 continue
+
+            det_params = PAIR_OVERRIDES.get((current_lang, best_lang), DEFAULT_PARAMS)
+            early_min   = det_params[0]
+            agreement   = det_params[4]
+            margin_min  = det_params[6]
+            short_extra = det_params[7]
+            switch_bias = det_params[11]
+            p_min_avg   = det_params[12]
+            p_min_steps = det_params[13]
+            ws_idx      = det_params[14]
+            ws_min      = det_params[15]
+            ws_win      = det_params[16]
 
             # Runner-up / margin from softmax scores
             runner_up = 0.0
@@ -198,29 +257,40 @@ def evaluate_pair(
                     runner_up = best_scores[i]
             margin = best_conf - runner_up
 
-            required = required_confidence(n, params, is_phrase)
+            required = required_confidence(n, det_params, is_phrase)
+            no_scores = all(s == 0.0 for s in best_scores)
             if required > 1.0:
+                # Below the pair's EarlyDetectionMinChars: pre-seed the
+                # agreement streak (mirrors C++), then wait for more chars.
+                update(best_lang, best_conf, [0.0, 0.0, 0.0, 0.0] if no_scores else best_scores)
                 continue
 
             # Short-input extra confidence (FP guard)
             if (n <= early_min + 2) and (not is_phrase) and short_extra > 0.0:
                 required = min(0.9999, required + short_extra)
 
-            if best_lang == last_lang:
-                streak += 1
-            else:
-                last_lang = best_lang
-                streak = 1
+            update(best_lang, best_conf, [0.0, 0.0, 0.0, 0.0] if no_scores else best_scores)
 
-            # Margin gate (skip when script gate fired — no real scores)
-            if (not script_fired) and margin_min > 0.0 and margin < margin_min:
+            # Incumbent-advantage gate (FP guard)
+            if (best_lang != current_lang and switch_bias > 0.0
+                    and best_conf < incumbent_conf + switch_bias):
                 continue
 
-            if (
-                streak >= agreement_count
-                and best_lang != current_lang
-                and best_conf >= required
-            ):
+            # Margin gate (skip when script gate fired — no real scores)
+            if (not script_fired) and (not no_scores) and margin_min > 0.0 and margin < margin_min:
+                continue
+
+            # Firing decision
+            fire = False
+            if (last_lang == best_lang and streak >= agreement) and best_conf >= required:
+                fire = True
+            if (not fire) and best_lang == "he":
+                if is_persistent("he", p_min_steps, p_min_avg):
+                    fire = True
+                elif weak_score_avg(ws_idx, ws_win) >= ws_min:
+                    fire = True
+
+            if fire and best_lang != current_lang:
                 return best_lang
 
         return None

@@ -26,17 +26,17 @@ from Languages import (
 LAYOUTS = {"en": english_layout, "ru": russian_layout, "he": hebrew_layout}
 _CLASS_LANG = {1: "en", 2: "he", 3: "ru"}
 
-# Field order matches cpp/src/Config.cpp SwitchingParams (11):
-#   EMin FConf CAt0 CAt1 Agr BLF  Mrg  SXC  PCS  HeVC HeCT
+# Field order matches cpp/src/Config.cpp SwitchingParams (17):
+#   EMin FConf CAt0 CAt1 Agr BLF Mrg SXC PCS HeVC HeCT SBM PMAC PMS WSCI WSMA WSW
 PAIR_OVERRIDES = {
-    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
-    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90),
-    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90),
-    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90),
+    ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
+    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
 }
-DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90)
+DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7)
 
 CURATED = [
     ("אני רוצה", "he"), ("כך רציתי", "he"), ("שלום לכולם", "he"),
@@ -93,6 +93,36 @@ def predict(text, current_lang, model_args, gates_on):
     he_ct = params[10]
     last_lang, streak = "", 0
     cache = {}
+    frames = []  # (lang, conf, scores)
+    cur_idx = next((i for i in (1, 2, 3) if _CLASS_LANG[i] == current_lang), 0)
+
+    def update(lang, conf, scores):
+        nonlocal last_lang, streak
+        if lang == last_lang:
+            streak += 1
+        else:
+            last_lang, streak = lang, 1
+        frames.append((lang, conf, list(scores)))
+        if len(frames) > 10:
+            frames.pop(0)
+
+    def is_persistent(lang, min_steps, min_avg):
+        if min_steps <= 0 or len(frames) < min_steps:
+            return False
+        s = 0.0
+        for f in frames[-min_steps:]:
+            if f[0] != lang:
+                return False
+            s += f[1]
+        return (s / min_steps) >= min_avg
+
+    def weak_score_avg(cls_idx, window):
+        if window <= 0 or len(frames) < window:
+            return 0.0
+        return sum(f[2][cls_idx] for f in frames[-window:]) / window
+
+    def is_phrase_fn(variants):
+        return any(" " in v for v in variants)
 
     for n in range(1, len(text) + 1):
         variants, seen = [text[:n]], {text[:n]}
@@ -105,8 +135,9 @@ def predict(text, current_lang, model_args, gates_on):
                 seen.add(v)
                 variants.append(v)
 
-        is_phrase = any(" " in v for v in variants)
+        is_phrase = is_phrase_fn(variants)
         best_lang, best_conf, best_scores = None, 0.0, [0.0, 0.0, 0.0, 0.0]
+        incumbent_conf = 0.0
         he_script_vc = 0.0
         for v in variants:
             if v in cache:
@@ -120,18 +151,28 @@ def predict(text, current_lang, model_args, gates_on):
                 cov = hebrew_script_coverage(v)
                 if cov >= he_ct and not (lang and lang != "he" and conf > 0.80):
                     he_script_vc = max(he_script_vc, cov * he_vc)
-            if conf > best_conf:
-                best_lang, best_conf, best_scores = lang, conf, scores
+            if lang is not None:
+                if cur_idx and scores[cur_idx] > incumbent_conf:
+                    incumbent_conf = scores[cur_idx]
+                if conf > best_conf:
+                    best_lang, best_conf, best_scores = lang, conf, scores
 
         script_fired = False
         if he_script_vc > best_conf:
             best_lang, best_conf, best_scores = "he", he_script_vc, [0, 0, 0, 0]
             script_fired = True
         if not best_lang:
+            update("", 0.0, [0, 0, 0, 0])
             continue
 
         det_params = PAIR_OVERRIDES.get((current_lang, best_lang), DEFAULT_PARAMS)
-        margin_min = det_params[6] if gates_on else 0.0
+        margin_min  = det_params[6] if gates_on else 0.0
+        switch_bias = det_params[11] if gates_on else 0.0
+        p_min_avg   = det_params[12]
+        p_min_steps = det_params[13]
+        ws_idx      = det_params[14]
+        ws_min      = det_params[15]
+        ws_win      = det_params[16]
         runner = max((best_scores[i] for i in (1, 2, 3)
                       if _CLASS_LANG[i] != best_lang), default=0.0)
         margin = best_conf - runner
@@ -140,14 +181,23 @@ def predict(text, current_lang, model_args, gates_on):
         if required > 1.0:
             continue
 
-        if best_lang == last_lang:
-            streak += 1
-        else:
-            last_lang, streak = best_lang, 1
+        no_scores = all(s == 0.0 for s in best_scores)
+        update(best_lang, best_conf, [0, 0, 0, 0] if no_scores else best_scores)
 
+        if (best_lang != current_lang and switch_bias > 0.0
+                and best_conf < incumbent_conf + switch_bias):
+            continue
         if (not script_fired) and margin_min > 0.0 and margin < margin_min:
             continue
-        if streak >= det_params[4] and best_lang != current_lang and best_conf >= required:
+
+        fire = (last_lang == best_lang and streak >= det_params[4]
+                and best_conf >= required)
+        if (not fire) and gates_on and best_lang == "he":
+            if is_persistent("he", p_min_steps, p_min_avg):
+                fire = True
+            elif weak_score_avg(ws_idx, ws_win) >= ws_min:
+                fire = True
+        if fire and best_lang != current_lang:
             return best_lang
     return None
 

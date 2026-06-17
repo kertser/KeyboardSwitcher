@@ -71,6 +71,36 @@ namespace Config {
         //   required to trigger the script gate (0.90 = 90 % of alpha chars).
         float HebrewScriptCoverageThreshold;
 
+        // ── Incumbent-advantage gate (FP guard) ───────────────────────
+        // SwitchBiasMargin: extra confidence the best SWITCH candidate must
+        //   have over the strongest "stay on the current language" signal
+        //   (the max ONNX confidence assigned to currentLang across all
+        //   variants — usually the identity variant).  A switch fires only
+        //   when bestConf >= incumbentConf + SwitchBiasMargin.  This is the
+        //   single biggest structural FP suppressor: a genuine current-language
+        //   word produces a strong incumbent signal that an accidental
+        //   cross-layout variant cannot beat.  0.0 = disabled.
+        float SwitchBiasMargin;
+
+        // ── Hebrew weak-signal gates (FN guard, →he pairs only) ───────
+        // These let detection fire on "flat-signal" Hebrew phrases that the
+        // model scores consistently but below the adaptive threshold.  They
+        // are OR-alternatives to the consecutive-agreement + confidence gate
+        // and only apply when bestLang == "he".
+        //
+        // Persistent Moderate Confidence Gate:
+        //   fires when the last PersistentMinSteps history frames ALL had
+        //   top-1 == "he" and the average top-1 confidence >= PersistentMinAvgConf.
+        float PersistentMinAvgConf;
+        int   PersistentMinSteps;
+        // Cumulative Weak Score Gate:
+        //   fires when the average softmax score for class WeakScoreClassIdx
+        //   (2 = Hebrew) over the last WeakScoreWindow frames >= WeakScoreMinAvg,
+        //   even when "he" was never the per-frame argmax winner.
+        int   WeakScoreClassIdx;
+        float WeakScoreMinAvg;
+        int   WeakScoreWindow;
+
         // Compute the required softmax confidence for a given text length.
         // isPhrase: true when the detection text contains a space — PhraseConfScale
         //   is then applied to lower the threshold.
@@ -112,6 +142,13 @@ namespace Config {
     // Unicode chars AND was not strongly claimed as another language by ONNX.
     // Catches clearly-Hebrew text the model scores ambiguously. Default: true.
     extern bool  EnableHebrewScriptGate;
+
+    // ── Hebrew weak-signal gates (FN guard) ───────────────────────────
+    // Persistent Moderate Confidence Gate and Cumulative Weak Score Gate.
+    // Both apply only to "he" targets and recover flat-signal Hebrew phrases
+    // the adaptive threshold would otherwise miss.  Default: true.
+    extern bool  EnablePersistentConfGate;
+    extern bool  EnableWeakScoreGate;
 
     // ================================================================
     // Case-signal Hebrew exclusion (Iteration 5 — A)

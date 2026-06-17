@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.4.3
+# Keyboard Switcher v1.4.4
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -38,11 +38,11 @@ native inference via ONNX Runtime.
 |---|---|
 | **Automatic language detection** | Detects the intended language and re-types the text in the correct layout |
 | **Esc to undo** | Press Escape after a correction to revert — even after typing more (up to 100 extra characters are buffered and converted back); invalidated by click, focus change, Enter, arrow / navigation keys, or manual layout switch |
-| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
+| **Learned exceptions** | Rejected corrections are remembered per-word so the same mistake is never repeated; exception and override keys are **case-folded** (`NormalizeKey` lowercases both store and lookup sides) so capitalised corrections (e.g. "IDF", "Hello") match the pre-capitalisation lookup correctly across the en/ru path; when an exception blocks one language a fallback detection tries the next-best language so the full word is still corrected |
 | **Adaptive confidence curve** | Short input requires near-certain confidence; longer input lowers the bar — reduces both false positives and false negatives |
 | **Per-language-pair tuning** | Each (from→to) pair has its own `EarlyDetectionMinChars`, `ConfidenceAtMinChars`, `ConfidenceAtMaxChars`, `ConsecutiveAgreementCount`, and `BorderlineZoneFactor`. For example, `en/ru→he` uses `EarlyMin=3` and a relaxed floor of `0.60` (sweep-validated at 84 % TP, <2 % FP on 200-word vocabulary samples) |
 | **Adaptive calibration** | Silently tunes per-pair `ConfidenceAtMaxChars` and `MinTop1Top2Margin` based on real usage. Rejected corrections and manual overrides signal "too aggressive"; accepted corrections (no undo within 10 s) signal "just right"; unprompted manual switches signal "too strict". An EWMA controller (α=0.2, min 5 events per batch, hysteresis band 0.15) steps thresholds by ≤ 0.01 / 0.005 per adaptation with asymmetric clamps — tightening up to +0.10 / +0.08, loosening limited to −0.05 / −0.01 relative to the factory baseline. State is persisted in `user_prefs.json` alongside exceptions, invalidated on version change, and reset via the tray menu. Fully invisible: no UI changes, adaptation noted only in the debug log |
-| **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo) |
+| **Typo resilience** | Two-tier protection: *consecutive-agreement* (requires 2+ keystrokes agreeing on a language) and *drop-one boosting* (drops one character at a time in the borderline zone to recover from a typo). Drop-one boosting **recomputes the runner-up and margin** from the boosted variant's own softmax so the top1/top2 margin gate remains honest |
 | **Capitalization preservation** | Per-character: every alpha character typed with Shift intent is uppercased in the corrected text. Works for sentence-initial caps ("Hello"), CamelCase ("iPhone"), and ALL-CAPS abbreviations ("IDF"). On layouts without uppercase (Hebrew), `VkToWchar` stores the base character + shift flag; the correction path restores uppercase from the recorded `shiftState_` vector via `GetShiftStates()` |
 | **Async correction (race-free)** | The backspace + retype sequence is dispatched to a detached worker thread so the hook returns `1` immediately — the triggering key is reliably blocked even when ONNX inference takes longer than Windows' `LowLevelHooksTimeout`. Real user keystrokes are eaten by the `g_isSendingInput` guard until the worker finishes |
 
@@ -53,15 +53,18 @@ native inference via ONNX Runtime.
 | **URL / path filter** | `skip_url_or_path` | Skips detection for `://`, `www.`, `http`, and `X:\` drive-path patterns |
 | **Low-alpha filter** | `skip_low_alpha` | Requires at least *EarlyDetectionMinChars* real letter characters before detection runs |
 | **Low known-chars gate** | `skip_low_known_chars` | Skips ONNX inference when fewer than *MinKnownCharsForInference* (default **2**) characters appear in the model vocabulary — prevents noise or symbol-only input from reaching the model |
+| **Incumbent-advantage gate** | — | Before a switch fires, the best switch candidate must exceed the strongest "stay on the current language" softmax signal (across all variants) by `SwitchBiasMargin`. A genuine current-language word produces a strong incumbent signal that an accidental cross-layout variant cannot beat. Tuned to **0.04 on →he pairs only** (zero cost on the single-word harness, blocks real-world false triggers); 0.0 on robust pairs where any positive value only costs true positives. Skipped on the user-rejection fallback path |
 | **Leaked-layout guard** | — | Rejects corrections where the source→target layout conversion would produce unmapped (leaked) characters |
 | **File-dialog protection** | `skip_file_dialog_en_protection` | When the active window is a file-open / save-as dialog (`#32770` + `DirectUIHWND` or `ComboBoxEx32`) and the current layout is English, auto-switching to Hebrew or Russian is blocked — filename entry is almost always Latin. Manual layout switches (Alt+Shift) are never affected. Controlled by **DisableAutoSwitchFromEnglishInFileDialogs** (default: on) |
-| **Case-signal Hebrew exclusion** | `EXCL: Hebrew excluded` | Hebrew has no uppercase letters. When the cached word contains ≥ *CaseExclusionMinCaps* (default **2**) alpha characters typed with Shift/CapsLock intent, **or** any internal capital (e.g. `iPhone`, `myVar`), Hebrew is removed from the candidate set before inference. Sentence-initial capitals (`"Hello"`) are **not** counted. Validated: 100 % of model Hebrew FPs on ALL-CAPS / CamelCase words eliminated; 0 real Hebrew TPs blocked |
+| **Case-signal Hebrew exclusion** | `EXCL: Hebrew excluded` | Hebrew has no uppercase letters. When the cached word contains ≥ *CaseExclusionMinCaps* (default **2**) alpha characters typed with Shift/CapsLock intent, **or** any internal capital (e.g. `iPhone`, `myVar`), Hebrew is removed from the candidate set before inference. Sentence-initial capitals (`"Hello"`) are **not** counted. Validated: 100 % of model Hebrew FPs on ALL-CAPS / CamelCase words eliminated; 0 real Hebrew TPs blocked. When a language is excluded the detection still considers the variant's **top-2** candidate instead of discarding the variant entirely — avoids false negatives when the correct target is the second choice |
 
 ### Hebrew-specific improvements
 
 | Feature | Description |
 |---|---|
 | **Final-form normalisation** | When a detection variant contains Hebrew characters the model also receives a normalised copy with sofit (word-final) forms replaced by their base equivalents — ך→כ, ם→מ, ן→נ, ף→פ, ץ→צ. The higher confidence score of the two runs is kept. The user's text is **never** modified by this normalisation |
+| **Hebrew weak-signal gates** | Two OR-alternatives to the consecutive-agreement gate that recover "flat-signal" Hebrew phrases the adaptive threshold would otherwise miss. Both fire only for the "he" target: **Persistent Moderate Confidence Gate** (`EnablePersistentConfGate`) — fires when all of the last 6 history frames had "he" as top-1 with average confidence ≥ 0.55; **Cumulative Weak Score Gate** (`EnableWeakScoreGate`) — fires when the rolling average of the "he" softmax class (index 2) over the last 7 frames ≥ 0.40. Both thresholds were tuned to add zero single-word false positives on the offline vocabulary harness |
+| **History rolling window** | `DetectionHistory` now maintains a 10-frame rolling window of full softmax vectors (`scores[4]`), enabling both weak-signal gates and richer debug diagnostics. A frame is pre-seeded at sub-pair-minimum char counts so the agreement streak counter is primed by the time the first detectable keystroke arrives |
 
 ### Window & session management
 
@@ -110,15 +113,25 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                keeping the hook well under LowLevelHooksTimeout.
 
 5. infer       TypoResilientDetect over all variants (excludedLangs passed in):
-                 Per variant -> PredictLanguageWithConfidence
-                   -> MinKnownCharsForInference gate (skip_low_known_chars)
-                   -> ONNX inference (softmax, 4 classes: N/A, en, he, ru)
-                   -> Hebrew sofit normalisation boost (if Hebrew chars present)
-                 Skip candidates in excludedLangs
-                 Pick best-confidence language across remaining variants
-                 Consecutive-agreement gate  (Tier 1)   <- always runs, even with exclusions
-                 Drop-one boosting in borderline zone    (Tier 2)
-                 Thresholds read from live-calibrated PairOverrides entry
+               Per variant -> PredictLanguageWithConfidence
+                 -> MinKnownCharsForInference gate (skip_low_known_chars)
+                 -> ONNX inference (softmax, 4 classes: N/A, en, he, ru)
+                 -> Hebrew sofit normalisation boost (if Hebrew chars present)
+               Track incumbent signal: max softmax[currentLang] across variants
+               When a language is in excludedLangs, use the variant's top-2 class
+               instead of discarding the variant (preserves signal for fallback)
+               Pick best-confidence NON-excluded language across variants
+               history.Update (once per keystroke, including pre-seed below EarlyMin)
+               Incumbent-advantage gate (SwitchBiasMargin): block switch unless
+                 bestConf >= incumbentConf + SwitchBiasMargin
+               Top1/top2 margin gate (MinTop1Top2Margin): block if model split
+               Drop-one boosting in borderline zone     (Tier 2)
+                 -> runner-up recomputed from boosted variant's softmax
+               Fire if:
+                 Tier 1: consecutive-agreement AND adaptive confidence  OR
+                 Tier 3-A: persistent moderate confidence gate (→he, 6 frames, ≥0.55)  OR
+                 Tier 3-B: cumulative weak score gate (→he, 7 frames avg "he" ≥0.40)
+               Thresholds read from live-calibrated PairOverrides entry
 
 6. post-filter skip_file_dialog_en_protection  (en->he/ru in file dialogs)
                Leaked-layout guard
@@ -156,6 +169,7 @@ KeyboardSwitcher/
 │   ├── Languages_torch.py   # PyTorch model class (used during training & export)
 │   ├── tune_confidence.py   # Offline grid-search for global adaptive confidence-curve parameters
 │   ├── evaluate_transitions.py  # Per-directed-pair TP/FP validation on vocabulary
+│   ├── test_phrases_lite.py     # Curated phrase recall with / without gates (Hebrew, Russian)
 │   ├── sweep_he_params.py   # Parameter sweep for Hebrew-target pairs
 │   ├── test_case_exclusion.py   # Validates case-signal Hebrew exclusion (ALL-CAPS, CamelCase)
 │   ├── requirements.txt
@@ -179,10 +193,12 @@ KeyboardSwitcher/
 │   │   │                    #   ApplyAdaptedParams (calibration sink)
 │   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
 │   │   │                    #   GetCachedConversionMap, TypoResilientDetect
-│   │   │                    #   (excludedLangs + isFallback parameters)
-│   │   ├── FeedbackLogger.h # User exception list, learned correction overrides,
-│   │   │                    #   adaptive calibration (Outcome enum,
-│   │   │                    #   RecordOutcome, ResetCalibration)
+│   │   │                    #   (excludedLangs + isFallback parameters);
+│   │   │                    #   DetectionHistory with rolling 10-frame window
+│   │   │                    #   (IsPersistent, WeakScoreAvg, scores[4] per frame)
+│   │   ├── FeedbackLogger.h # User exception list (case-folded NormalizeKey),
+│   │   │                    #   learned correction overrides, adaptive calibration
+│   │   │                    #   (Outcome enum, RecordOutcome, ResetCalibration)
 │   │   ├── InputCache.h     # Per-keystroke buffer; UpperCount, HasInternalCapital,
 │   │   │                    #   GetShiftStates (per-char capitalisation restore)
 │   │   ├── WindowTracker.h
@@ -199,10 +215,15 @@ KeyboardSwitcher/
 │   │   │                    #   ApplyAdaptedParams (live calibration sink)
 │   │   ├── Languages.cpp    # ONNX inference, RunInference helper,
 │   │   │                    #   NormalizeHebrewFinals, GetCachedConversionMap,
-│   │   │                    #   TypoResilientDetect (isFallback decoupled);
-│   │   │                    #   PredictLanguage removed (dead code)
+│   │   │                    #   DetectionHistory (IsPersistent, WeakScoreAvg,
+│   │   │                    #   rolling frames with scores[4]);
+│   │   │                    #   TypoResilientDetect: incumbent tracking,
+│   │   │                    #   top-2 fallback for excluded langs, honest
+│   │   │                    #   margin recompute after drop-one boost,
+│   │   │                    #   persistent + weak-score Hebrew gates
 │   │   ├── FeedbackLogger.cpp  # EWMA calibration controller, PairCalibration
-│   │   │                    #   state machine, exceptions, overrides,
+│   │   │                    #   state machine, exceptions/overrides with
+│   │   │                    #   case-folded keys (NormalizeKey),
 │   │   │                    #   user_prefs.json persistence
 │   │   ├── InputCache.cpp   # UpperCount, HasInternalCapital, GetShiftStates implementations
 │   │   ├── WindowTracker.cpp
@@ -239,8 +260,9 @@ Key files:
 | `Languages.py` | ONNX inference & keyboard-layout conversion utilities |
 | `Languages_torch.py` | PyTorch model class (used during training & export) |
 | `tune_confidence.py` | Offline grid-search for global adaptive confidence-curve parameters |
-| `evaluate_transitions.py` | Per-directed-pair TP/FP validation on vocabulary word lists (mirrors `Config::PairOverrides` and the source-restricted variant generation in `main.cpp`) |
+| `evaluate_transitions.py` | Per-directed-pair TP/FP validation on vocabulary word lists. Mirrors `Config::PairOverrides` (17-field params), source-restricted variant generation, incumbent gate, history rolling window, and all three Hebrew weak-signal gates from `TypoResilientDetect` in `main.cpp`. Run: `python evaluate_transitions.py --sample 200` |
 | `sweep_he_params.py` | Sweep `EarlyDetectionMinChars` and `ConfidenceAtMaxChars` for Hebrew-target pairs to find the TP/FP Pareto frontier |
+| `test_phrases_lite.py` | Curated Hebrew/Russian phrase recall with and without signal-quality gates. Mirrors 17-field `PAIR_OVERRIDES` and the full gate stack (incumbent, persistent, weak-score). Reference: 96/104 WITH gates |
 | `test_case_exclusion.py` | Validates the case-signal Hebrew exclusion: ALL-CAPS English/Russian + CamelCase → 100 % of model FPs eliminated, 0 real Hebrew TPs blocked |
 | `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
@@ -312,29 +334,41 @@ Global defaults (apply to any pair not listed in `PairOverrides`):
 | `EnableTypoResilience` | true | Master toggle for consecutive-agreement and drop-one boosting |
 | `EnableCaseBasedHeExclusion` | **true** | Exclude Hebrew when the cached word has uppercase-intent characters (ALL-CAPS / CamelCase) |
 | `CaseExclusionMinCaps` | **2** | Minimum number of Shift/CapsLock alpha chars before "he" is excluded (sentence-initial caps do **not** count) |
+| `EnableHebrewScriptGate` | **true** | Virtual "he" confidence for a variant that is ≥ 90 % Hebrew Unicode characters |
+| `EnablePersistentConfGate` | **true** | Fire →he switch when last 6 frames all had "he" as top-1 with average confidence ≥ `PersistentMinAvgConf` |
+| `EnableWeakScoreGate` | **true** | Fire →he switch when rolling 7-frame average of the "he" softmax class ≥ `WeakScoreMinAvg` |
+| `SwitchBiasMargin` (→he) | **0.04** | Incumbent-advantage guard: switch candidate must exceed the strongest "stay on current language" softmax score by this margin. 0.0 on robust pairs; 0.04 on →he pairs (zero harness cost, blocks real-world false triggers) |
+| `PersistentMinAvgConf` | **0.55** | Average top-1 confidence required for the Persistent Moderate Confidence gate |
+| `PersistentMinSteps` | **6** | Number of consecutive frames all voting "he" required for the persistent gate. Tuned from 5 → 6 to eliminate a single-word false positive on the offline harness |
+| `WeakScoreClassIdx` | **2** | Softmax class tracked by the Cumulative Weak Score gate (2 = Hebrew) |
+| `WeakScoreMinAvg` | **0.40** | Minimum rolling average of the tracked class score for the weak-score gate to fire |
+| `WeakScoreWindow` | **7** | Number of history frames used for the rolling weak-score average |
 
-Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, validated by offline sweep on 200-word vocabulary samples. `ConfidenceAtMaxChars` and `MinTop1Top2Margin` are the live targets of the adaptive calibration controller (the factory values are stored as baselines; the controller applies a bounded delta on top):
+Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, validated by offline sweep on 200-word vocabulary samples (`evaluate_transitions.py --sample 200`). `ConfidenceAtMaxChars` and `MinTop1Top2Margin` are the live targets of the adaptive calibration controller (the factory values are stored as baselines; the controller applies a bounded delta on top):
 
-| Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax ¹ | Agreement | Borderline | Margin ¹ | TP rate | FP rate |
-|---|---|---|---|---|---|---|---|---|---|
-| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 96.5 % | 0 % |
-| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 92.0 % | 0 % |
-| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **84.0 %** | <1 %* |
-| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 92.5 % | 0 % |
-| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **84.0 %** | <2 %* |
-| he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 0.05 | 96.5 % | 0 % |
+| Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax ¹ | Agreement | Borderline | Margin ¹ | SwitchBias | TP rate | FP rate |
+|---|---|---|---|---|---|---|---|---|---|---|
+| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 93.5 % | 0 % |
+| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 91.0 % | 0 % |
+| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.04** | **92.0 %** | <1 %* |
+| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 93.0 % | 0 % |
+| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.04** | **92.0 %** | <2 %* |
+| he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 0.05 | 0.00 | 96.0 % | 0 % |
 
 > ¹ Factory (baseline) values. At runtime the calibration controller can raise `ConfAtMax` by up to +0.10 and `Margin` by up to +0.08 (too many FPs), or lower them by up to −0.05 / −0.01 (too many missed detections). Calibrated deltas are persisted in `%APPDATA%\KeyboardSwitcher\user_prefs.json`.
 >
 > \* Harness FP without case-exclusion guard. The C++ app additionally
-> suppresses these via `EnableCaseBasedHeExclusion` and `HasLeakedLayoutChars`,
-> so real-world FP is lower.
+> suppresses these via `EnableCaseBasedHeExclusion`, `HasLeakedLayoutChars`, and the
+> incumbent-advantage gate (`SwitchBiasMargin`), so real-world FP is lower.
 >
-> `en→he` and `ru→he` use `EarlyMin=3` (vs. 4 for other pairs): sweep showed +4–7 pp TP
-> gain. `ConfAtMax=0.60` replaces the old conservative 0.75 floor.
-> Remaining missed detections (~16 %) are model-bound.
+> `en→he` and `ru→he` use `EarlyMin=3` (vs. 4 for other pairs): sweep showed +4–7 pp TP gain.
+> `ConfAtMax=0.60` replaces the old conservative 0.75 floor.
+> `SwitchBiasMargin=0.04` (→he only) adds an extra real-world FP guard at zero harness cost.
+> Remaining missed detections (~8 %) are model-bound.
 > All TP/FP numbers measured on the source-restricted harness (200-word vocabulary samples,
 > `evaluate_transitions.py --sample 200`).
+> Curated Hebrew/Russian phrase recall: **96/104** (0.923) with all gates enabled
+> (`test_phrases_lite.py`).
 
 ### Adaptive calibration internals
 

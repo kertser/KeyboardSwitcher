@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <ctime>
 #include <cmath>
+#include <cwctype>
 #include <algorithm>
 #include <set>
 #include <nlohmann/json.hpp>
@@ -119,6 +120,18 @@ static std::string ws2s(const std::wstring& ws) {
     std::string out(sz, 0);
     WideCharToMultiByte(CP_UTF8, 0, ws.data(), (int)ws.size(),
                         out.data(), sz, nullptr, nullptr);
+    return out;
+}
+
+// Case-fold a key for exception / override matching.
+// Hebrew has no case (no-op), while English/Russian corrected texts may be
+// capitalised before they are applied (e.g. "Hello", "IDF").  Add* stores the
+// post-capitalisation text, but IsException/GetOverride are checked against the
+// pre-capitalisation candidate — so both sides must be normalised to lowercase
+// to match reliably across the en/ru capitalisation path.
+static std::wstring NormalizeKey(const std::wstring& s) {
+    std::wstring out = s;
+    for (auto& ch : out) ch = towlower(ch);
     return out;
 }
 
@@ -459,7 +472,7 @@ void AddException(const std::string& toLang,
     auto& langSet = g_exceptions[toLang];
     // Cap per-language to avoid unbounded growth
     if (langSet.size() >= MAX_EXCEPTIONS_PER_LANG) return;
-    langSet.insert(correctedText);
+    langSet.insert(NormalizeKey(correctedText));
     SavePrefs();
 }
 
@@ -469,18 +482,20 @@ bool IsException(const std::string& toLang,
     if (it == g_exceptions.end()) return false;
     const auto& exSet = it->second;
 
+    const std::wstring key = NormalizeKey(correctedText);
+
     // Exact match — the user rejected this exact text before.
-    if (exSet.count(correctedText) > 0) return true;
+    if (exSet.count(key) > 0) return true;
 
     // Prefix match — the proposed text is the beginning of a known-bad
     // correction.  The user is still building up the same word on the
     // same physical keys; block early so the model can't fire on a
     // partial prefix before the full exception text is reached.
     // std::set is sorted, so lower_bound finds the first element >= key.
-    auto lb = exSet.lower_bound(correctedText);
+    auto lb = exSet.lower_bound(key);
     if (lb != exSet.end() &&
-        lb->size() >= correctedText.size() &&
-        lb->compare(0, correctedText.size(), correctedText) == 0) {
+        lb->size() >= key.size() &&
+        lb->compare(0, key.size(), key) == 0) {
         return true;
     }
 
@@ -493,7 +508,7 @@ void AddOverride(const std::string& currentLang,
     if (text.empty() || currentLang == targetLang) return;
     auto& langMap = g_overrides[currentLang];
     if (langMap.size() >= MAX_EXCEPTIONS_PER_LANG) return;
-    langMap[text] = targetLang;
+    langMap[NormalizeKey(text)] = targetLang;
     SavePrefs();
 }
 
@@ -501,7 +516,7 @@ std::string GetOverride(const std::string& currentLang,
                         const std::wstring& text) {
     auto it = g_overrides.find(currentLang);
     if (it == g_overrides.end()) return {};
-    auto it2 = it->second.find(text);
+    auto it2 = it->second.find(NormalizeKey(text));
     if (it2 != it->second.end()) return it2->second;
     return {};
 }

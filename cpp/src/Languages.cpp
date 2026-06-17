@@ -357,22 +357,57 @@ std::optional<DetectionResult> LanguageDetector::PredictLanguageWithConfidence(c
 // ============================================================
 // DetectionHistory
 // ============================================================
-void DetectionHistory::Update(const std::string& lang, float /*confidence*/) {
+void DetectionHistory::Update(const std::string& lang, float confidence,
+                              const float* scores4) {
     if (lang == lastLang_) {
         ++streak_;
     } else {
         lastLang_ = lang;
         streak_ = 1;
     }
+
+    Frame f;
+    f.lang = lang;
+    f.conf = confidence;
+    if (scores4) {
+        for (int i = 0; i < 4; ++i) f.scores[i] = scores4[i];
+    }
+    frames_.push_back(std::move(f));
+    if (frames_.size() > MAX_WINDOW)
+        frames_.erase(frames_.begin());
 }
 
 bool DetectionHistory::IsConsistent(const std::string& currentLang, int requiredCount) const {
     return currentLang == lastLang_ && streak_ >= requiredCount;
 }
 
+bool DetectionHistory::IsPersistent(const std::string& lang, int minSteps,
+                                    float minAvgConf) const {
+    if (minSteps <= 0 || static_cast<int>(frames_.size()) < minSteps)
+        return false;
+    float sum = 0.0f;
+    for (int i = 0; i < minSteps; ++i) {
+        const Frame& f = frames_[frames_.size() - 1 - i];
+        if (f.lang != lang) return false;
+        sum += f.conf;
+    }
+    return (sum / static_cast<float>(minSteps)) >= minAvgConf;
+}
+
+float DetectionHistory::WeakScoreAvg(int classIdx, int window) const {
+    if (classIdx < 0 || classIdx > 3 || window <= 0) return 0.0f;
+    int n = std::min(window, static_cast<int>(frames_.size()));
+    if (n < window) return 0.0f;   // require a full window
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i)
+        sum += frames_[frames_.size() - 1 - i].scores[classIdx];
+    return sum / static_cast<float>(n);
+}
+
 void DetectionHistory::Clear() {
     lastLang_.clear();
     streak_ = 0;
+    frames_.clear();
 }
 
 // ============================================================
@@ -420,6 +455,14 @@ std::optional<DetectionResult> TypoResilientDetect(
     std::wstring bestVariant;
     DetectionResult bestFullResult = {};   // keeps softmax scores for margin gate
 
+    // Incumbent strength: the strongest "stay on the current language" signal
+    // across all variants (usually the identity variant).  Used by the
+    // incumbent-advantage gate to suppress accidental switches.
+    float       incumbentConf = 0.0f;
+    int         curIdx = 0;
+    for (int i = 1; i < 4; ++i)
+        if (currentLang == kClassLang[i]) { curIdx = i; break; }
+
     // Hebrew Script Coverage gate: best virtual-Hebrew confidence across variants.
     float        heScriptVirtualConf = 0.0f;
     std::wstring heScriptVariant;
@@ -450,13 +493,32 @@ std::optional<DetectionResult> TypoResilientDetect(
             }
         }
 
-        if (result.has_value() && result->confidence > bestConf) {
-            // Skip languages the caller has excluded (user-rejected / case-signal)
-            if (excludedLangs.count(result->language)) continue;
-            bestConf       = result->confidence;
-            bestLang       = result->language;
-            bestVariant    = variant;
-            bestFullResult = *result;
+        if (result.has_value()) {
+            // Track the incumbent (stay-on-current-language) signal, even
+            // when currentLang is only the top-2 class for this variant.
+            if (curIdx != 0 && result->scores[curIdx] > incumbentConf)
+                incumbentConf = result->scores[curIdx];
+
+            // Pick this variant's strongest NON-excluded candidate from the
+            // full softmax.  When excludedLangs is empty this is identical to
+            // result->language/confidence; when a language is excluded (case
+            // signal / user rejection) we fall back to the variant's top-2
+            // instead of discarding the whole variant (avoids FN).
+            int   candIdx  = 0;
+            float candConf = 0.0f;
+            for (int i = 1; i < 4; ++i) {
+                if (excludedLangs.count(kClassLang[i])) continue;
+                if (result->scores[i] > candConf) {
+                    candConf = result->scores[i];
+                    candIdx  = i;
+                }
+            }
+            if (candIdx != 0 && candConf > bestConf) {
+                bestConf       = candConf;
+                bestLang       = kClassLang[candIdx];
+                bestVariant    = variant;
+                bestFullResult = *result;
+            }
         }
     }
 
@@ -492,7 +554,11 @@ std::optional<DetectionResult> TypoResilientDetect(
     // --- Look up per-pair switching parameters ---
     const auto& params = Config::GetParamsForPair(currentLang, bestLang);
 
-    // Phrase mode: a space in any variant means ≥ 2 words → relax threshold.
+    // Phrase mode: a space in any variant means ≥ 2 words → relax threshold
+    // (via PhraseConfScale, →he pairs only).  An empirical ablation
+    // (model/exp_phrase.py) showed that requiring "non-trivial" words here
+    // costs ~10 % Hebrew-phrase recall for no measurable FP benefit, so the
+    // simple any-space rule is kept.
     bool isPhrase = false;
     for (const auto& v : textVariants) {
         if (v.find(L' ') != std::wstring::npos) { isPhrase = true; break; }
@@ -501,8 +567,20 @@ std::optional<DetectionResult> TypoResilientDetect(
 
     // Per-pair min-chars check: the pair may require more characters
     // than the global minimum that was used as the early-out in the caller.
+    // We still record a history frame here (pre-seeding the agreement
+    // streak): this preserves recall on words whose length equals the pair's
+    // EarlyDetectionMinChars (they would otherwise have only one eligible
+    // frame and could never satisfy a 2-consecutive agreement gate).  The
+    // confidence threshold at this low char count is near-certainty (≈0.99),
+    // so the pre-seed cannot by itself cause a false positive.
     if (static_cast<int>(numChars) < params.EarlyDetectionMinChars) {
-        if (!isFallback) history.Update(bestLang, bestConf);
+        if (!isFallback) {
+            bool nsLow = (bestFullResult.scores[0] == 0.0f &&
+                          bestFullResult.scores[1] == 0.0f &&
+                          bestFullResult.scores[2] == 0.0f &&
+                          bestFullResult.scores[3] == 0.0f);
+            history.Update(bestLang, bestConf, nsLow ? nullptr : bestFullResult.scores);
+        }
         return std::nullopt;
     }
 
@@ -546,44 +624,86 @@ std::optional<DetectionResult> TypoResilientDetect(
                 res->confidence > bestConf)
             {
                 bestConf = res->confidence;
-                margin   = bestConf - runnerUpConf;   // keep margin in sync
+                // Recompute the runner-up from THIS result's softmax so the
+                // margin gate stays honest (the old code left runnerUpConf at
+                // its stale pre-boost value, inflating the margin → FP risk).
+                float ru = 0.0f;
+                for (int i = 1; i < 4; ++i) {
+                    const std::string cls = kClassLang[i];
+                    if (cls == bestLang || excludedLangs.count(cls)) continue;
+                    if (res->scores[i] > ru) ru = res->scores[i];
+                }
+                runnerUpConf   = ru;
+                margin         = bestConf - runnerUpConf;
+                bestFullResult = *res;   // keep scores in sync with bestConf
             }
         }
     }
 
-    // --- History & consecutive-agreement gate ---
-    // When this is a fallback call (excludedLangs non-empty), skip
-    // history update and the agreement gate — the primary detection
-    // already proved consistency, and the user explicitly rejected
-    // the top choice.  We only require the confidence threshold.
-    if (!isFallback) {
-        // Update the history with whatever language won this round.
-        history.Update(bestLang, bestConf);
+    // --- History update (exactly once per keystroke) ---
+    // Records this keystroke's frame BEFORE any gate evaluates, so the
+    // agreement / persistent / weak-score gates see the current frame.
+    // The script-gate path has no real softmax scores → pass nullptr.
+    bool noScores = (bestFullResult.scores[0] == 0.0f &&
+                     bestFullResult.scores[1] == 0.0f &&
+                     bestFullResult.scores[2] == 0.0f &&
+                     bestFullResult.scores[3] == 0.0f);
+    if (!isFallback)
+        history.Update(bestLang, bestConf, noScores ? nullptr : bestFullResult.scores);
 
-        // --- Tier 1: Consecutive-agreement gate ---
-        if (Config::EnableTypoResilience) {
-            if (!history.IsConsistent(bestLang, params.ConsecutiveAgreementCount)) {
-                return std::nullopt;
-            }
-        }
+    // --- Incumbent-advantage gate (false-positive guard) ---
+    // A switch fires only when the best candidate beats the strongest
+    // "stay on the current language" signal by SwitchBiasMargin.  A genuine
+    // current-language word produces a strong incumbent signal that an
+    // accidental cross-layout variant cannot overcome.  Skipped on fallback
+    // (the user explicitly rejected the top choice, so any alternative is
+    // already known to be a switch).
+    if (!isFallback && bestLang != currentLang &&
+        params.SwitchBiasMargin > 0.0f &&
+        bestConf < incumbentConf + params.SwitchBiasMargin) {
+        return std::nullopt;
     }
 
     // --- Margin gate (false-positive guard) ---
     // A low top1/top2 gap means the model is split between two languages.
     // Skip on fallback, and skip when the Hebrew script gate fired (no real
     // ONNX scores → margin is meaningless, indicated by all-zero scores).
-    {
-        bool noScores = (bestFullResult.scores[0] == 0.0f &&
-                         bestFullResult.scores[1] == 0.0f &&
-                         bestFullResult.scores[2] == 0.0f &&
-                         bestFullResult.scores[3] == 0.0f);
-        if (!isFallback && !noScores && params.MinTop1Top2Margin > 0.0f &&
-            margin < params.MinTop1Top2Margin) {
-            return std::nullopt;
-        }
+    if (!isFallback && !noScores && params.MinTop1Top2Margin > 0.0f &&
+        margin < params.MinTop1Top2Margin) {
+        return std::nullopt;
     }
 
-    if (bestConf >= requiredConfidence) {
+    // --- Firing decision: stability gate AND confidence, OR a Hebrew
+    //     weak-signal alternative (FN guard for flat-signal phrases) ---
+    bool fire = false;
+    if (!isFallback) {
+        // Tier 1: consecutive-agreement gate + adaptive confidence threshold.
+        bool agreementOk = !Config::EnableTypoResilience ||
+                           history.IsConsistent(bestLang, params.ConsecutiveAgreementCount);
+        if (agreementOk && bestConf >= requiredConfidence)
+            fire = true;
+
+        // Tier 3 (→he only): weak-signal alternatives recover Hebrew phrases
+        // the model scores consistently but below the adaptive threshold.
+        if (!fire && bestLang == "he") {
+            if (Config::EnablePersistentConfGate &&
+                history.IsPersistent("he", params.PersistentMinSteps,
+                                     params.PersistentMinAvgConf)) {
+                fire = true;   // Tier 3-A: persistent moderate confidence
+            } else if (Config::EnableWeakScoreGate &&
+                       history.WeakScoreAvg(params.WeakScoreClassIdx,
+                                            params.WeakScoreWindow)
+                           >= params.WeakScoreMinAvg) {
+                fire = true;   // Tier 3-B: cumulative weak score
+            }
+        }
+    } else {
+        // Fallback: confidence threshold only (agreement already proven by
+        // the primary detection; the user explicitly rejected the top choice).
+        fire = (bestConf >= requiredConfidence);
+    }
+
+    if (fire) {
         DetectionResult result = bestFullResult;
         result.language = bestLang;
         result.confidence = bestConf;

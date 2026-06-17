@@ -16,15 +16,30 @@ struct DetectionResult {
 
 // ============================================================
 // DetectionHistory – tracks consecutive-keystroke agreement
+//                    plus a rolling window of softmax frames for
+//                    the Hebrew weak-signal gates.
 // ============================================================
 class DetectionHistory {
 public:
-    // Record the result of the latest detection pass.
-    void Update(const std::string& lang, float confidence);
+    // Record the result of the latest detection pass.  scores4 (optional)
+    // is the full softmax vector [N/A, en, he, ru]; when supplied it feeds
+    // the persistent / weak-score gates.
+    void Update(const std::string& lang, float confidence,
+                const float* scores4 = nullptr);
 
     // Returns true when the last N detections (N = requiredCount)
     // all predicted the same language.
     bool IsConsistent(const std::string& currentLang, int requiredCount) const;
+
+    // Persistent Moderate Confidence Gate: true when the last `minSteps`
+    // frames ALL had top-1 == lang and their average top-1 confidence
+    // is >= minAvgConf.
+    bool IsPersistent(const std::string& lang, int minSteps,
+                      float minAvgConf) const;
+
+    // Cumulative Weak Score Gate: average softmax score for class index
+    // `classIdx` over the last `window` frames (0 if not enough frames).
+    float WeakScoreAvg(int classIdx, int window) const;
 
     // Reset (call on mouse-click, manual switch, Alt+Tab, etc.)
     void Clear();
@@ -32,6 +47,14 @@ public:
 private:
     std::string lastLang_;
     int         streak_ = 0;
+
+    struct Frame {
+        std::string lang;       // top-1 language ("" = N/A)
+        float       conf = 0.0f;
+        float       scores[4] = {0, 0, 0, 0};
+    };
+    static constexpr size_t MAX_WINDOW = 10;
+    std::vector<Frame> frames_;   // newest at back, capped at MAX_WINDOW
 };
 
 class LanguageDetector {
