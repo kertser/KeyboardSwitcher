@@ -1313,9 +1313,59 @@ static bool HasLeakedLayoutChars(const std::wstring& text,
 }
 
 // ============================================================
+// Helper: derive a safe hook-timeout threshold (ms)
+// ============================================================
+// Returns the number of milliseconds the detection may run before we
+// must assume Windows has already delivered the triggering key to the
+// foreground app (LowLevelHooksTimeout).  The actual OS value lives in
+//   HKCU\Control Panel\Desktop : LowLevelHooksTimeout  (default 300 ms
+// when absent — but group policy / tweaks can set it much lower).  We
+// read it once and subtract a safety margin so we compensate slightly
+// early rather than slightly late: an extra backspace under BlockInput
+// is invisible (nothing to delete past the word start), whereas a
+// missing backspace leaves a stray leading char ("афсуищщл"→"afacebook").
+static ULONGLONG GetHookTimeoutSafeMs() {
+    static ULONGLONG cached = 0;
+    if (cached != 0) return cached;
+
+    DWORD osTimeout = 300; // OS default when the value is absent
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0,
+                      KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS) {
+        DWORD value = 0, size = sizeof(value), type = 0;
+        if (RegQueryValueExW(hKey, L"LowLevelHooksTimeout", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && value > 0) {
+            osTimeout = value;
+        }
+        RegCloseKey(hKey);
+    }
+
+    // Safety margin: compensate when we have used ~2/3 of the OS budget,
+    // and never wait longer than 100 ms below the OS timeout.
+    DWORD margin = osTimeout / 3;
+    if (margin < 100) margin = 100;
+    ULONGLONG safe = (osTimeout > margin) ? (osTimeout - margin) : 1;
+    if (safe < 50) safe = 50; // floor so we don't compensate on every key
+    cached = safe;
+    return cached;
+}
+
+// ============================================================
 // Low-level keyboard hook procedure
 // ============================================================
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    // ── Hook-entry timestamp (race fix) ──────────────────────────────
+    // Captured at the very top so it reflects the FULL time the OS has
+    // been waiting for this hook to return.  Windows starts its
+    // LowLevelHooksTimeout clock when it INVOKES the hook, so the
+    // timeout-compensation logic below must measure from here — not from
+    // just before ONNX inference — otherwise the preprocessing time
+    // (VkToWchar/ToUnicodeEx, variant building, etc.) is invisible and we
+    // under-detect timeouts, leaving a stray leading char on screen
+    // (e.g. "афсуищщл" → "afacebook").
+    const ULONGLONG hookEntryMs = GetTickCount64();
+
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
     if (!Config::EnableSwitcher.load())
@@ -1920,12 +1970,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             // ONNX inference runs synchronously here, inside the low-level
             // keyboard hook.  Windows has a LowLevelHooksTimeout (default
             // ~300 ms) after which it delivers the key to the app anyway,
-            // even if the hook later returns 1.  We time the detection so
-            // that the correction thread can compensate: if inference took
-            // >= HOOK_TIMEOUT_SAFE_MS we assume the triggering key was already
-            // delivered and add one extra backspace (bsCount = cacheLen
-            // instead of cacheLen-1).
-            ULONGLONG hookDetectStartMs = GetTickCount64();
+            // even if the hook later returns 1.  The correction thread
+            // compensates using the hook-entry timestamp (hookEntryMs, set at
+            // the top of this callback) and the registry-derived threshold:
+            // if the hook has run >= GetHookTimeoutSafeMs() we assume the
+            // triggering key was already delivered and add one extra backspace
+            // (bsCount = cacheLen instead of cacheLen-1).
 
             auto detection = TypoResilientDetect(
                 *g_detector, textVariants, currentLangId, alphaCount, g_history,
@@ -2136,16 +2186,22 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     //
                     // ── Timeout compensation ────────────────────────────
                     // Even with the async dispatch, the ONNX inference above
-                    // still runs synchronously in this callback.  If it took
-                    // >= HOOK_TIMEOUT_SAFE_MS (conservative, below the default
-                    // 300 ms OS LowLevelHooksTimeout), Windows may have already
-                    // delivered the triggering key to the app before we reach
-                    // `return 1`.  In that case the app has cacheLen chars on
-                    // screen (not cacheLen-1) and we must send one extra
-                    // backspace to avoid leaving a stray character.
-                    static constexpr ULONGLONG HOOK_TIMEOUT_SAFE_MS = 200;
+                    // still runs synchronously in this callback.  If the hook
+                    // has been running >= the OS LowLevelHooksTimeout budget,
+                    // Windows may have already delivered the triggering key to
+                    // the app before we reach `return 1`.  In that case the app
+                    // has cacheLen chars on screen (not cacheLen-1) and we must
+                    // send one extra backspace to avoid leaving a stray char.
+                    //
+                    // The elapsed time is measured from the hook ENTRY
+                    // (hookEntryMs, captured at the very top of this callback)
+                    // so it includes ALL pre-inference work — matching the
+                    // clock Windows uses.  The threshold is derived from the
+                    // actual registry LowLevelHooksTimeout, not a hardcoded
+                    // guess, so machines with a lowered timeout are handled.
+                    const ULONGLONG HOOK_TIMEOUT_SAFE_MS = GetHookTimeoutSafeMs();
                     ULONGLONG detectionElapsedMs =
-                        GetTickCount64() - hookDetectStartMs;
+                        GetTickCount64() - hookEntryMs;
                     bool hookMayHaveTimedOut =
                         (detectionElapsedMs >= HOOK_TIMEOUT_SAFE_MS);
 
