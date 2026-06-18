@@ -100,12 +100,96 @@ def predict_language(text, ort_session, char_to_index, max_length):
 # ============================================================
 # Prediction with confidence (mirrors C++ PredictLanguageWithConfidence)
 # ============================================================
+# Process-wide memoization of inference results.  The ONNX model is fixed for
+# the lifetime of a process, so the softmax output for a given input string is
+# constant and param-independent.  The offline tuning harnesses (especially
+# recalibrate.py, which sweeps gate parameters over a large grid) call this
+# function on the same variant strings thousands of times; caching turns the
+# dominant cost (ONNX inference) into a one-time-per-string expense and makes
+# the grid sweep effectively free after the first config.
+_PREDICT_CACHE: dict = {}
+
+
+def clear_predict_cache() -> None:
+    """Drop the memoized inference results (call after swapping the model)."""
+    _PREDICT_CACHE.clear()
+
+
 def predict_language_with_confidence(
     text, ort_session, char_to_index, max_length
 ) -> Optional[DetectionResult]:
     """Run inference and return a DetectionResult with softmax scores,
     or None if N/A has the highest probability."""
 
+    cached = _PREDICT_CACHE.get(text, False)
+    if cached is not False:
+        return cached
+
+    result = _predict_language_with_confidence_uncached(
+        text, ort_session, char_to_index, max_length)
+    _PREDICT_CACHE[text] = result
+    return result
+
+
+def _encode(text, char_to_index, max_length):
+    """Mirror the production tokenizer: drop OOV chars, pad/truncate to max_length."""
+    idx = [char_to_index.get(c, 0) for c in text if c in char_to_index]
+    if len(idx) < max_length:
+        idx += [0] * (max_length - len(idx))
+    return idx[:max_length]
+
+
+def _scores_to_result(scores) -> Optional[DetectionResult]:
+    best_class, best_prob = 0, 0.0
+    for i in range(1, 4):
+        if scores[i] > best_prob:
+            best_prob = scores[i]
+            best_class = i
+    if scores[0] > best_prob:
+        return None
+    lang = _class_to_language(best_class)
+    if lang is None:
+        return None
+    return DetectionResult(language=lang, confidence=best_prob, scores=scores)
+
+
+def prewarm_cache(texts, ort_session, char_to_index, max_length, batch_size=1024) -> int:
+    """Batch-infer every string in *texts* once and populate the predict cache.
+
+    The offline tuning harnesses query the same variant strings repeatedly across
+    a large parameter grid.  Running ONNX one row at a time dominates the runtime;
+    batching hundreds of rows per session.run() call is an order of magnitude
+    faster.  Returns the number of newly inferred (previously uncached) strings.
+    """
+    pending = []
+    seen = set()
+    for t in texts:
+        if t in _PREDICT_CACHE or t in seen:
+            continue
+        seen.add(t)
+        pending.append(t)
+
+    if not pending:
+        return 0
+
+    input_name = ort_session.get_inputs()[0].name
+    for start in range(0, len(pending), batch_size):
+        chunk = pending[start:start + batch_size]
+        batch = np.array([_encode(t, char_to_index, max_length) for t in chunk],
+                         dtype=np.int64)
+        logits = ort_session.run(None, {input_name: batch})[0]
+        logits = logits[:, :4]
+        m = np.max(logits, axis=1, keepdims=True)
+        exps = np.exp(logits - m)
+        softmax = exps / np.sum(exps, axis=1, keepdims=True)
+        for t, row in zip(chunk, softmax):
+            _PREDICT_CACHE[t] = _scores_to_result(row.tolist())
+    return len(pending)
+
+
+def _predict_language_with_confidence_uncached(
+    text, ort_session, char_to_index, max_length
+) -> Optional[DetectionResult]:
     input_indices = [char_to_index.get(char, 0) for char in text if char in char_to_index]
 
     # Padding / truncation

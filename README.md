@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.4.4
+# Keyboard Switcher v1.5.0
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -53,7 +53,7 @@ native inference via ONNX Runtime.
 | **URL / path filter** | `skip_url_or_path` | Skips detection for `://`, `www.`, `http`, and `X:\` drive-path patterns |
 | **Low-alpha filter** | `skip_low_alpha` | Requires at least *EarlyDetectionMinChars* real letter characters before detection runs |
 | **Low known-chars gate** | `skip_low_known_chars` | Skips ONNX inference when fewer than *MinKnownCharsForInference* (default **2**) characters appear in the model vocabulary — prevents noise or symbol-only input from reaching the model |
-| **Incumbent-advantage gate** | — | Before a switch fires, the best switch candidate must exceed the strongest "stay on the current language" softmax signal (across all variants) by `SwitchBiasMargin`. A genuine current-language word produces a strong incumbent signal that an accidental cross-layout variant cannot beat. Tuned to **0.04 on →he pairs only** (zero cost on the single-word harness, blocks real-world false triggers); 0.0 on robust pairs where any positive value only costs true positives. Skipped on the user-rejection fallback path |
+| **Incumbent-advantage gate** | — | Before a switch fires, the best switch candidate must exceed the strongest "stay on the current language" softmax signal (across all variants) by `SwitchBiasMargin`. A genuine current-language word produces a strong incumbent signal that an accidental cross-layout variant cannot beat. Tuned to **0.02 on →he pairs only** (after the v2.x model retrain the incumbent EN signal on Hebrew-typed-on-English phrases rose to ~0.93–0.95, so 0.04 blocked ~4 genuine Hebrew phrases at zero single-word FP benefit; 0.02 restores full phrase recall while keeping the guard); 0.0 on robust pairs where any positive value only costs true positives. Skipped on the user-rejection fallback path |
 | **Leaked-layout guard** | — | Rejects corrections where the source→target layout conversion would produce unmapped (leaked) characters |
 | **File-dialog protection** | `skip_file_dialog_en_protection` | When the active window is a file-open / save-as dialog (`#32770` + `DirectUIHWND` or `ComboBoxEx32`) and the current layout is English, auto-switching to Hebrew or Russian is blocked — filename entry is almost always Latin. Manual layout switches (Alt+Shift) are never affected. Controlled by **DisableAutoSwitchFromEnglishInFileDialogs** (default: on) |
 | **Case-signal Hebrew exclusion** | `EXCL: Hebrew excluded` | Hebrew has no uppercase letters. When the cached word contains ≥ *CaseExclusionMinCaps* (default **2**) alpha characters typed with Shift/CapsLock intent, **or** any internal capital (e.g. `iPhone`, `myVar`), Hebrew is removed from the candidate set before inference. Sentence-initial capitals (`"Hello"`) are **not** counted. Validated: 100 % of model Hebrew FPs on ALL-CAPS / CamelCase words eliminated; 0 real Hebrew TPs blocked. When a language is excluded the detection still considers the variant's **top-2** candidate instead of discarding the variant entirely — avoids false negatives when the correct target is the second choice |
@@ -262,7 +262,7 @@ Key files:
 | `tune_confidence.py` | Offline grid-search for global adaptive confidence-curve parameters |
 | `evaluate_transitions.py` | Per-directed-pair TP/FP validation on vocabulary word lists. Mirrors `Config::PairOverrides` (17-field params), source-restricted variant generation, incumbent gate, history rolling window, and all three Hebrew weak-signal gates from `TypoResilientDetect` in `main.cpp`. Run: `python evaluate_transitions.py --sample 200` |
 | `sweep_he_params.py` | Sweep `EarlyDetectionMinChars` and `ConfidenceAtMaxChars` for Hebrew-target pairs to find the TP/FP Pareto frontier |
-| `test_phrases_lite.py` | Curated Hebrew/Russian phrase recall with and without signal-quality gates. Mirrors 17-field `PAIR_OVERRIDES` and the full gate stack (incumbent, persistent, weak-score). Reference: 96/104 WITH gates |
+| `test_phrases_lite.py` | Curated Hebrew/Russian phrase recall with and without signal-quality gates. Mirrors 17-field `PAIR_OVERRIDES` and the full gate stack (incumbent, persistent, weak-score). Reference: **91/104** WITH gates (new model; gates are neutral: WITH = WITHOUT baseline) |
 | `test_case_exclusion.py` | Validates the case-signal Hebrew exclusion: ALL-CAPS English/Russian + CamelCase → 100 % of model FPs eliminated, 0 real Hebrew TPs blocked |
 | `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
@@ -337,7 +337,7 @@ Global defaults (apply to any pair not listed in `PairOverrides`):
 | `EnableHebrewScriptGate` | **true** | Virtual "he" confidence for a variant that is ≥ 90 % Hebrew Unicode characters |
 | `EnablePersistentConfGate` | **true** | Fire →he switch when last 6 frames all had "he" as top-1 with average confidence ≥ `PersistentMinAvgConf` |
 | `EnableWeakScoreGate` | **true** | Fire →he switch when rolling 7-frame average of the "he" softmax class ≥ `WeakScoreMinAvg` |
-| `SwitchBiasMargin` (→he) | **0.04** | Incumbent-advantage guard: switch candidate must exceed the strongest "stay on current language" softmax score by this margin. 0.0 on robust pairs; 0.04 on →he pairs (zero harness cost, blocks real-world false triggers) |
+| `SwitchBiasMargin` (→he) | **0.02** | Incumbent-advantage guard: switch candidate must exceed the strongest "stay on current language" softmax score by this margin. 0.0 on robust pairs; 0.02 on →he pairs (after v2.x retrain incumbent EN signal rose to ~0.93–0.95, so the previous 0.04 blocked genuine Hebrew phrases; 0.02 restores full phrase recall at zero single-word FP cost) |
 | `PersistentMinAvgConf` | **0.55** | Average top-1 confidence required for the Persistent Moderate Confidence gate |
 | `PersistentMinSteps` | **6** | Number of consecutive frames all voting "he" required for the persistent gate. Tuned from 5 → 6 to eliminate a single-word false positive on the offline harness |
 | `WeakScoreClassIdx` | **2** | Softmax class tracked by the Cumulative Weak Score gate (2 = Hebrew) |
@@ -348,11 +348,11 @@ Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, vali
 
 | Pair | EarlyMin | FullConf | ConfAtMin | ConfAtMax ¹ | Agreement | Borderline | Margin ¹ | SwitchBias | TP rate | FP rate |
 |---|---|---|---|---|---|---|---|---|---|---|
-| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 93.5 % | 0 % |
-| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 91.0 % | 0 % |
-| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.04** | **92.0 %** | <1 %* |
-| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 93.0 % | 0 % |
-| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.04** | **92.0 %** | <2 %* |
+| en→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 96.0 % | 0 % |
+| ru→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 90.0 % | <1 %* |
+| **en→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.02** | **93.0 %** | <1 %* |
+| he→en | 4 | 15 | 0.99 | 0.70 | 2 | 0.85 | 0.05 | 0.00 | 90.0 % | 0 % |
+| **ru→he** | **3** | 15 | 0.99 | **0.60** | 2 | 0.88 | 0.10 | **0.02** | **93.0 %** | <1 %* |
 | he→ru | 4 | 15 | 0.99 | 0.70 | 2 | 0.80 | 0.05 | 0.00 | 96.0 % | 0 % |
 
 > ¹ Factory (baseline) values. At runtime the calibration controller can raise `ConfAtMax` by up to +0.10 and `Margin` by up to +0.08 (too many FPs), or lower them by up to −0.05 / −0.01 (too many missed detections). Calibrated deltas are persisted in `%APPDATA%\KeyboardSwitcher\user_prefs.json`.
@@ -363,12 +363,12 @@ Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, vali
 >
 > `en→he` and `ru→he` use `EarlyMin=3` (vs. 4 for other pairs): sweep showed +4–7 pp TP gain.
 > `ConfAtMax=0.60` replaces the old conservative 0.75 floor.
-> `SwitchBiasMargin=0.04` (→he only) adds an extra real-world FP guard at zero harness cost.
-> Remaining missed detections (~8 %) are model-bound.
+> `SwitchBiasMargin=0.02` (→he only) adds an extra real-world FP guard at zero harness cost (reduced from 0.04 which blocked ~4 genuine Hebrew phrases with the retrained model).
+> Remaining missed detections (~7–10 %) are model-bound.
 > All TP/FP numbers measured on the source-restricted harness (200-word vocabulary samples,
 > `evaluate_transitions.py --sample 200`).
-> Curated Hebrew/Russian phrase recall: **96/104** (0.923) with all gates enabled
-> (`test_phrases_lite.py`).
+> Curated Hebrew/Russian phrase recall: **91/104** (0.875) with all gates enabled
+> (`test_phrases_lite.py`); WITH-gates = WITHOUT-gates (gates are neutral on this model).
 
 ### Adaptive calibration internals
 

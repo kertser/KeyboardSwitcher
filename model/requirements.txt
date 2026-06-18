@@ -2,10 +2,14 @@
 numpy
 onnxruntime
 
-# Model training (LangModel.ipynb)
+# Model training (train_model.py — v2 BiLSTM)
+#   PyTorch is the only hard training dependency; install the CUDA build for
+#   GPU training, e.g.:
+#   pip3 install torch --index-url https://download.pytorch.org/whl/cu118
+# torch
+
+# Legacy notebook (LangModel.ipynb) extras
 # pandas
 # scikit-learn
 # tensorboard
 # python-Levenshtein
-# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-

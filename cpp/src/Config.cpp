@@ -75,10 +75,13 @@ namespace Config {
     // Margin gate (Mrg): 0.05 on robust en↔ru / he→en / he→ru pairs (cheap
     //   FP insurance — measurably free on the single-word harness), and a
     //   stricter 0.10 on →he pairs where EN/HE softmax frequently compete.
-    // SwitchBiasMargin (SBM): incumbent-advantage FP guard.  Tuned to 0.04 on
-    //   →he only (zero cost on the offline harness, blocks real-world switches
-    //   when the text-as-typed is confidently valid current-language); 0.0 on
-    //   the robust pairs where it only cost true positives.
+    // SwitchBiasMargin (SBM): incumbent-advantage FP guard.  Tuned to 0.02 on
+    //   →he only (after the v2.x model retrain the incumbent EN signal on
+    //   Hebrew-typed-on-English phrases rose to ~0.93–0.95, so the previous
+    //   0.04 blocked ~4 genuine Hebrew phrases — "בוקר טוב", "ברוך הבא",
+    //   "הכל בסדר", "בוא נדבר", "מה קורה" — at zero single-word FP benefit;
+    //   0.02 restores full phrase recall while keeping an incumbent guard);
+    //   0.0 on the robust pairs where it only cost true positives.
     // Persistent / weak-score gates (PMS=6, WSMA=0.40): restored Hebrew
     //   flat-signal recovery, tuned so they add NO single-word false positive
     //   on the offline harness while remaining available for long Hebrew
@@ -96,13 +99,13 @@ namespace Config {
         //     Margin=0.10  — stricter top1/top2 gap (Hebrew/EN often compete)
         //     PhraseScale=0.80 — 20 % lower threshold for multi-word phrases
         //     HeScriptVC=0.78  — a 100 %-Hebrew variant gets virtual conf 0.78
-        //     SBM=0.04 — incumbent advantage; persistent/weak gates active for →he
-        { {"en", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f, 0.10f, 0.00f, 0.80f, 0.78f, 0.90f,  0.04f, 0.55f, 6, 2, 0.40f, 7 } },
+        //     SBM=0.02 — incumbent advantage; persistent/weak gates active for →he
+        { {"en", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f, 0.10f, 0.00f, 0.80f, 0.78f, 0.90f,  0.02f, 0.55f, 6, 2, 0.40f, 7 } },
         { {"he", "en"}, { 4, 15, 0.99f, 0.70f, 2, 0.85f, 0.05f, 0.02f, 1.00f, 0.00f, 0.90f,  0.00f, 0.55f, 6, 2, 0.40f, 7 } },
 
         // ── Russian ↔ Hebrew ───
         // ru→he: same tuning + gates as en→he.
-        { {"ru", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f, 0.10f, 0.00f, 0.80f, 0.78f, 0.90f,  0.04f, 0.55f, 6, 2, 0.40f, 7 } },
+        { {"ru", "he"}, { 3, 15, 0.99f, 0.60f, 2, 0.88f, 0.10f, 0.00f, 0.80f, 0.78f, 0.90f,  0.02f, 0.55f, 6, 2, 0.40f, 7 } },
         { {"he", "ru"}, { 4, 15, 0.99f, 0.70f, 2, 0.80f, 0.05f, 0.02f, 1.00f, 0.00f, 0.90f,  0.00f, 0.55f, 6, 2, 0.40f, 7 } },
     };
 

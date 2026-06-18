@@ -52,14 +52,16 @@ VOCAB_FILES = {
 DEFAULT_PARAMS = (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7)
 PAIR_OVERRIDES = {
     # Margin gate: 0.05 on robust pairs (cheap FP insurance), 0.10 on →he.
-    # SwitchBiasMargin (idx 11): incumbent guard, 0.04 on →he only (zero
-    #   harness cost), 0.0 on robust pairs.  Persistent/weak gates (PMS=6,
-    #   WSMA=0.40) restored for Hebrew flat-signal recovery with no FP cost.
+    # SwitchBiasMargin (idx 11): incumbent guard, 0.02 on →he only (after the
+    #   v2.x retrain the incumbent EN signal rose, so 0.04 blocked ~4 genuine
+    #   Hebrew phrases at zero single-word FP benefit), 0.0 on robust pairs.
+    #   Persistent/weak gates (PMS=6, WSMA=0.40) for Hebrew flat-signal recovery
+    #   with no FP cost.
     ("en", "ru"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
     ("ru", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
-    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("en", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.02, 0.55, 6, 2, 0.40, 7),
     ("he", "en"): (4, 15, 0.99, 0.70, 2, 0.85, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
-    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.04, 0.55, 6, 2, 0.40, 7),
+    ("ru", "he"): (3, 15, 0.99, 0.60, 2, 0.88, 0.10, 0.00, 0.80, 0.78, 0.90, 0.02, 0.55, 6, 2, 0.40, 7),
     ("he", "ru"): (4, 15, 0.99, 0.70, 2, 0.80, 0.05, 0.02, 1.00, 0.00, 0.90, 0.00, 0.55, 6, 2, 0.40, 7),
 }
 
