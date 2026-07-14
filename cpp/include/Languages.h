@@ -125,6 +125,19 @@ const std::unordered_map<wchar_t, wchar_t>& GetCachedConversionMap(
 float ComputeHebrewScriptCoverage(const std::wstring& text);
 
 // ============================================================
+// Word-aware consensus prediction (v1.5.x)
+// ============================================================
+// Scores a (possibly multi-word) string and returns a DetectionResult.
+// For multi-word input the whole-string softmax is fused with a per-word
+// length-weighted mean softmax via a geometric-mean consensus, so a class
+// wins only when BOTH the whole-string and the word-by-word views agree.
+// For single-word input this is identical to
+// LanguageDetector::PredictLanguageWithConfidence (no behavioural change).
+// Controlled by Config::EnableWordAwareDetection and the WordAware* params.
+std::optional<DetectionResult> PredictConsensus(
+    LanguageDetector& detector, const std::wstring& text);
+
+// ============================================================
 // Typo-resilient detection wrapper
 // ============================================================
 // Runs detection across all layout variants, applies:

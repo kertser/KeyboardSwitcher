@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <numeric>
 #include <map>
+#include <cmath>
 #include <cwctype>
 
 // nlohmann/json single-header
@@ -430,6 +431,111 @@ float ComputeHebrewScriptCoverage(const std::wstring& text) {
 static const char* kClassLang[4] = { "", "en", "he", "ru" };
 
 // ============================================================
+// Word-aware consensus detection (v1.5.x)
+// ============================================================
+// Rationale: feeding the whole multi-word buffer to the model as one string
+// dilutes short words / prepositions / particles and lets one odd token flip
+// the verdict for the entire phrase.  We additionally score each word on its
+// own, combine the per-word softmax into a length-weighted mean, and fuse that
+// with the whole-string softmax via a geometric mean.  A class wins only when
+// BOTH views agree — this lifts phrase recall and suppresses false positives
+// where the two views disagree.  Validated offline (model/eval_consensus.py).
+
+// Per-word contribution weight.  Longer words carry more reliable language
+// signal (capped so a single long word cannot dominate); very short words
+// (prepositions, particles, single letters) are down-weighted.
+static float WordAwareWeight(size_t knownLen) {
+    if (knownLen == 0) return 0.0f;
+    size_t capped = (std::min)(knownLen, static_cast<size_t>(Config::WordAwareLenCap));
+    float w = static_cast<float>(capped);
+    if (static_cast<int>(knownLen) <= Config::WordAwareShortMaxLen)
+        w *= Config::WordAwareShortWeight;
+    return w;
+}
+
+// Aggregate per-word softmax into a length-weighted mean.  Returns false when
+// the text has fewer than WordAwareMinWords words (caller uses whole-string).
+static bool ComputeWordAwareScores(LanguageDetector& detector,
+                                   const std::wstring& text,
+                                   float outScores[4]) {
+    // Split on spaces.
+    std::vector<std::wstring> words;
+    std::wstring cur;
+    for (wchar_t c : text) {
+        if (c == L' ') {
+            if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) words.push_back(cur);
+
+    if (static_cast<int>(words.size()) < Config::WordAwareMinWords)
+        return false;
+
+    double agg[4]  = {0.0, 0.0, 0.0, 0.0};
+    double totalW  = 0.0;
+    for (const auto& w : words) {
+        float weight = WordAwareWeight(w.size());
+        if (weight <= 0.0f) continue;
+        auto r = detector.PredictLanguageWithConfidence(w);
+        if (!r.has_value()) {
+            agg[0] += weight;                     // word reads as N/A
+        } else {
+            for (int i = 0; i < 4; ++i)
+                agg[i] += weight * r->scores[i];
+        }
+        totalW += weight;
+    }
+    if (totalW <= 0.0) return false;
+    for (int i = 0; i < 4; ++i)
+        outScores[i] = static_cast<float>(agg[i] / totalW);
+    return true;
+}
+
+std::optional<DetectionResult> PredictConsensus(
+    LanguageDetector& detector, const std::wstring& text)
+{
+    auto whole = detector.PredictLanguageWithConfidence(text);
+
+    float waScores[4];
+    if (!Config::EnableWordAwareDetection ||
+        !ComputeWordAwareScores(detector, text, waScores)) {
+        // Single word (or disabled): identical to the whole-string verdict.
+        return whole;
+    }
+
+    // Whole-string softmax (default to all-N/A when the whole read as N/A).
+    float wScores[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (whole.has_value())
+        for (int i = 0; i < 4; ++i) wScores[i] = whole->scores[i];
+
+    // Geometric-mean consensus: high only where BOTH views agree.
+    float comb[4];
+    float z = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        float a = wScores[i]  > 0.0f ? wScores[i]  : 0.0f;
+        float b = waScores[i] > 0.0f ? waScores[i] : 0.0f;
+        comb[i] = std::sqrt(a * b);
+        z += comb[i];
+    }
+    if (z <= 0.0f) return std::nullopt;
+    for (int i = 0; i < 4; ++i) comb[i] /= z;
+
+    int   bestClass = 0;
+    float bestProb  = 0.0f;
+    for (int i = 1; i < 4; ++i)
+        if (comb[i] > bestProb) { bestProb = comb[i]; bestClass = i; }
+    if (comb[0] >= bestProb) return std::nullopt;   // N/A dominates
+
+    DetectionResult res{};
+    res.language   = kClassLang[bestClass];
+    res.confidence = bestProb;
+    for (int i = 0; i < 4; ++i) res.scores[i] = comb[i];
+    return res;
+}
+
+// ============================================================
 // Typo-resilient detection
 // ============================================================
 std::optional<DetectionResult> TypoResilientDetect(
@@ -468,7 +574,7 @@ std::optional<DetectionResult> TypoResilientDetect(
     std::wstring heScriptVariant;
 
     for (const auto& variant : textVariants) {
-        auto result = detector.PredictLanguageWithConfidence(variant);
+        auto result = PredictConsensus(detector, variant);
 
         // ── Hebrew script coverage check (parallel to ONNX) ──────────
         if (Config::EnableHebrewScriptGate &&
@@ -618,7 +724,7 @@ std::optional<DetectionResult> TypoResilientDetect(
             ++dropIters;
             std::wstring dropped = bestVariant.substr(0, i)
                                  + bestVariant.substr(i + 1);
-            auto res = detector.PredictLanguageWithConfidence(dropped);
+            auto res = PredictConsensus(detector, dropped);
             if (res.has_value() &&
                 res->language == bestLang &&
                 res->confidence > bestConf)

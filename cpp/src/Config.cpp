@@ -156,6 +156,17 @@ namespace Config {
     bool  EnablePersistentConfGate = true;
     bool  EnableWeakScoreGate      = true;
 
+    // ── Word-aware consensus detection (v1.5.x) ──
+    // Per-word scoring fused with the whole-string softmax via geometric-mean
+    // consensus.  Only affects multi-word buffers; single words are unchanged.
+    // Weighting: base weight = min(wordLen, LenCap); words <= ShortMaxLen chars
+    // are multiplied by ShortWeight (they carry little discriminative signal).
+    bool  EnableWordAwareDetection = true;
+    int   WordAwareMinWords        = 2;
+    int   WordAwareShortMaxLen     = 2;
+    float WordAwareShortWeight     = 0.35f;
+    int   WordAwareLenCap          = 8;
+
     // ── Case-signal Hebrew exclusion (Iteration 5 — A) ────────────
     // Exclude "he" when ≥ CaseExclusionMinCaps alpha chars were typed
     // with Shift intent, OR any internal (non-leading) alpha char was

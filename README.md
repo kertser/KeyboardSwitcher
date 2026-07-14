@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.5.0
+# Keyboard Switcher v1.6.0
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -113,10 +113,18 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                keeping the hook well under LowLevelHooksTimeout.
 
 5. infer       TypoResilientDetect over all variants (excludedLangs passed in):
-               Per variant -> PredictLanguageWithConfidence
-                 -> MinKnownCharsForInference gate (skip_low_known_chars)
-                 -> ONNX inference (softmax, 4 classes: N/A, en, he, ru)
-                 -> Hebrew sofit normalisation boost (if Hebrew chars present)
+               Per variant -> PredictConsensus (word-aware):
+                 -> whole-string PredictLanguageWithConfidence
+                 -> if >= 2 words: also score each word, combine into a
+                    length-weighted mean softmax (short words down-weighted),
+                    then FUSE with the whole-string softmax via a geometric
+                    mean (a class wins only when BOTH views agree).  Single
+                    word -> identical to the whole-string verdict (no change).
+                    Lifts phrase recall and cuts FP where the views disagree
+                    (offline: recall 0.888->0.914, FP 0.017->0.012).
+                  -> MinKnownCharsForInference gate (skip_low_known_chars)
+                  -> ONNX inference (softmax, 4 classes: N/A, en, he, ru)
+                  -> Hebrew sofit normalisation boost (if Hebrew chars present)
                Track incumbent signal: max softmax[currentLang] across variants
                When a language is in excludedLangs, use the variant's top-2 class
                instead of discarding the variant (preserves signal for fallback)
@@ -171,6 +179,10 @@ KeyboardSwitcher/
 │   ├── evaluate_transitions.py  # Per-directed-pair TP/FP validation on vocabulary
 │   ├── test_phrases_lite.py     # Curated phrase recall with / without gates (Hebrew, Russian)
 │   ├── sweep_he_params.py   # Parameter sweep for Hebrew-target pairs
+│   ├── word_aware.py        # Word-aware per-word aggregation + geometric-mean consensus
+│   ├── eval_consensus.py    # Validates word-aware consensus vs whole-string (recall + FP)
+│   ├── eval_word_aware.py   # Recall / FP harness for the word-aware scorer
+│   ├── ablate_stopwords.py  # Ablation: stop-word list vs length-only weighting
 │   ├── test_case_exclusion.py   # Validates case-signal Hebrew exclusion (ALL-CAPS, CamelCase)
 │   ├── requirements.txt
 │   ├── dictionary.json
@@ -194,6 +206,7 @@ KeyboardSwitcher/
 │   │   ├── Languages.h      # LanguageDetector, NormalizeHebrewFinals,
 │   │   │                    #   GetCachedConversionMap, TypoResilientDetect
 │   │   │                    #   (excludedLangs + isFallback parameters);
+│   │   │                    #   PredictConsensus (word-aware phrase scoring);
 │   │   │                    #   DetectionHistory with rolling 10-frame window
 │   │   │                    #   (IsPersistent, WeakScoreAvg, scores[4] per frame)
 │   │   ├── FeedbackLogger.h # User exception list (case-folded NormalizeKey),

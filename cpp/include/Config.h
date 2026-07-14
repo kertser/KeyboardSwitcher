@@ -151,6 +151,31 @@ namespace Config {
     extern bool  EnableWeakScoreGate;
 
     // ================================================================
+    // Word-aware consensus detection (v1.5.x)
+    // ================================================================
+    // The detector normally feeds the WHOLE accumulated buffer into the
+    // model as one string and takes a single softmax over the entire
+    // phrase — short words, prepositions and particles get diluted, and one
+    // odd token can flip the verdict for the whole phrase.
+    //
+    // When enabled, a multi-word variant is ALSO scored word-by-word: each
+    // word's softmax is combined into a length-weighted mean (short words
+    // down-weighted, since they carry little language signal), and that
+    // per-word view is fused with the whole-string softmax via a
+    // geometric-mean CONSENSUS.  A class scores high only when BOTH views
+    // agree, which lifts recall on genuine same-language phrases while
+    // suppressing false positives where the two views disagree.  Validated
+    // offline (model/eval_consensus.py): recall 0.888→0.914, FP 0.017→0.012.
+    //
+    // Single-word input is unaffected (consensus == whole-string), so there
+    // is zero regression risk on the single-word path.
+    extern bool  EnableWordAwareDetection;   // master toggle (default: true)
+    extern int   WordAwareMinWords;          // aggregate only at >= this many words
+    extern int   WordAwareShortMaxLen;       // words this short are down-weighted
+    extern float WordAwareShortWeight;       // weight multiplier for short words
+    extern int   WordAwareLenCap;            // cap on the length-based base weight
+
+    // ================================================================
     // Case-signal Hebrew exclusion (Iteration 5 — A)
     // ================================================================
     // Hebrew has no upper/lowercase. When the cached text contains
