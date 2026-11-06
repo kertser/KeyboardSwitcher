@@ -1,5 +1,6 @@
 #include "Languages.h"
 #include "Config.h"
+#include "Triage.h"
 
 #include <onnxruntime_cxx_api.h>
 #include <windows.h>
@@ -594,6 +595,33 @@ std::optional<DetectionResult> TypoResilientDetect(
                                       requiredConfidence + params.ShortInputExtraConf);
     }
 
+    // --- Lexical triage (advisory, hybrid pipeline) ---
+    // Suppress: the identity text (as typed) is fully attested in the
+    // current language → raise the bar for switching away (and veto the
+    // Tier-3 →he gates below).  Boost: the switch-candidate variant is
+    // fully attested in the target language → relax the bar.  The LSTM
+    // still makes the decision; the triage only moves the threshold.
+    // Mirrors model/evaluate_transitions.py / model/test_phrases_lite.py.
+    bool lexSuppress = false;
+    if (Config::EnableLexicalTriage && !isFallback &&
+        bestLang != currentLang && !textVariants.empty())
+    {
+        const LexicalTriage* triage = LexicalTriage::Instance();
+        if (triage) {
+            // textVariants[0] is always the identity (text as typed).
+            float incEv = triage->Evidence(textVariants[0], currentLang);
+            if (incEv >= Config::TriageSuppressThreshold) {
+                lexSuppress = true;
+                requiredConfidence = std::min(0.9999f,
+                    requiredConfidence + Config::TriageSuppressExtra);
+            } else {
+                float swEv = triage->Evidence(bestVariant, bestLang);
+                if (swEv >= Config::TriageBoostThreshold)
+                    requiredConfidence *= Config::TriageBoostScale;
+            }
+        }
+    }
+
     // --- Tier 2: Drop-one boosting (borderline zone) ---
     // If the confidence is close to but below the threshold, a single typo
     // character may be dragging it down.  Try removing each character once
@@ -685,7 +713,11 @@ std::optional<DetectionResult> TypoResilientDetect(
 
         // Tier 3 (→he only): weak-signal alternatives recover Hebrew phrases
         // the model scores consistently but below the adaptive threshold.
-        if (!fire && bestLang == "he") {
+        // Vetoed when the lexical triage attested the typed text in the
+        // current language (lexSuppress) — a fully-attested word is not a
+        // mistyped Hebrew phrase.
+        if (!fire && bestLang == "he" &&
+            !(lexSuppress && Config::TriageSuppressBlocksGates)) {
             if (Config::EnablePersistentConfGate &&
                 history.IsPersistent("he", params.PersistentMinSteps,
                                      params.PersistentMinAvgConf)) {

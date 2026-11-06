@@ -87,7 +87,7 @@ def required_confidence(n, params, is_phrase, gates_on):
     return req
 
 
-def predict(text, current_lang, model_args, gates_on):
+def predict(text, current_lang, model_args, gates_on, triage=None):
     params = PAIR_OVERRIDES.get((current_lang, "he"), DEFAULT_PARAMS)
     he_vc = params[9] if gates_on else 0.0
     he_ct = params[10]
@@ -137,8 +137,10 @@ def predict(text, current_lang, model_args, gates_on):
 
         is_phrase = is_phrase_fn(variants)
         best_lang, best_conf, best_scores = None, 0.0, [0.0, 0.0, 0.0, 0.0]
+        best_variant = ""
         incumbent_conf = 0.0
         he_script_vc = 0.0
+        he_script_variant = ""
         for v in variants:
             if v in cache:
                 lang, conf, scores = cache[v]
@@ -150,16 +152,20 @@ def predict(text, current_lang, model_args, gates_on):
             if he_vc > 0.0 and current_lang != "he":
                 cov = hebrew_script_coverage(v)
                 if cov >= he_ct and not (lang and lang != "he" and conf > 0.80):
-                    he_script_vc = max(he_script_vc, cov * he_vc)
+                    if cov * he_vc > he_script_vc:
+                        he_script_vc = cov * he_vc
+                        he_script_variant = v
             if lang is not None:
                 if cur_idx and scores[cur_idx] > incumbent_conf:
                     incumbent_conf = scores[cur_idx]
                 if conf > best_conf:
                     best_lang, best_conf, best_scores = lang, conf, scores
+                    best_variant = v
 
         script_fired = False
         if he_script_vc > best_conf:
             best_lang, best_conf, best_scores = "he", he_script_vc, [0, 0, 0, 0]
+            best_variant = he_script_variant
             script_fired = True
         if not best_lang:
             update("", 0.0, [0, 0, 0, 0])
@@ -181,6 +187,20 @@ def predict(text, current_lang, model_args, gates_on):
         if required > 1.0:
             continue
 
+        # Lexical triage (advisory): suppress switches away from attested
+        # current-language text, boost well-attested switch candidates.
+        lex_suppress = False
+        if triage is not None and best_lang != current_lang:
+            tparams = triage.params
+            inc_ev = triage.evidence(variants[0], current_lang)
+            if inc_ev >= tparams.suppress_threshold:
+                lex_suppress = True
+                required = min(0.9999, required + tparams.suppress_extra)
+            else:
+                sw_ev = triage.evidence(best_variant, best_lang)
+                if sw_ev >= tparams.boost_threshold:
+                    required = required * tparams.boost_scale
+
         no_scores = all(s == 0.0 for s in best_scores)
         update(best_lang, best_conf, [0, 0, 0, 0] if no_scores else best_scores)
 
@@ -192,7 +212,9 @@ def predict(text, current_lang, model_args, gates_on):
 
         fire = (last_lang == best_lang and streak >= det_params[4]
                 and best_conf >= required)
-        if (not fire) and gates_on and best_lang == "he":
+        if ((not fire) and gates_on and best_lang == "he"
+                and not (lex_suppress and triage is not None
+                         and triage.params.suppress_blocks_gates)):
             if is_persistent("he", p_min_steps, p_min_avg):
                 fire = True
             elif weak_score_avg(ws_idx, ws_win) >= ws_min:
@@ -202,7 +224,7 @@ def predict(text, current_lang, model_args, gates_on):
     return None
 
 
-def run(gates_on, model_args):
+def run(gates_on, model_args, triage=None):
     hits = 0
     total = 0
     for native, lang in CURATED:
@@ -212,12 +234,24 @@ def run(gates_on, model_args):
                 continue
             mistyped = convert_text_bidirectional(native, LAYOUTS[lang], LAYOUTS[src])
             total += 1
-            if predict(mistyped, src, model_args, gates_on) == lang:
+            if predict(mistyped, src, model_args, gates_on, triage=triage) == lang:
                 hits += 1
     return hits, total
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Curated phrase detection validator")
+    parser.add_argument("--triage", action="store_true",
+                        help="Also report gates + lexical triage")
+    args = parser.parse_args()
+
+    triage = None
+    if args.triage:
+        from triage import LexicalTriage
+        print("Building lexical triage (dictionaries / BK-trees) ...")
+        triage = LexicalTriage()
+
     print("Loading ONNX model...")
     model_args = Languages.load_model()
     off_hits, total = run(False, model_args)
@@ -226,6 +260,10 @@ def main():
     print(f"  WITHOUT gates : {off_hits}/{total} ({off_hits/total:.3f})")
     print(f"  WITH    gates : {on_hits}/{total} ({on_hits/total:.3f})")
     print(f"  delta         : {on_hits - off_hits:+d} phrases")
+    if triage is not None:
+        tri_hits, _ = run(True, model_args, triage=triage)
+        print(f"  gates + triage: {tri_hits}/{total} ({tri_hits/total:.3f})  "
+              f"(delta vs gates: {tri_hits - on_hits:+d})")
 
 
 if __name__ == "__main__":

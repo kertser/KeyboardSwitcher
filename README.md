@@ -1,4 +1,4 @@
-# Keyboard Switcher v1.5.0
+# Keyboard Switcher v1.7.0
 
 Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on **Windows**.
 
@@ -28,7 +28,10 @@ A large dataset was collected from English, Hebrew, and Russian dictionaries and
 train a deep-learning model with an LSTM architecture that detects the intended language
 with >99 % accuracy on the test set. The PyTorch model is trained on GPU but runs on
 CPU without any problem; the C++ version uses the model exported to ONNX format for fast
-native inference via ONNX Runtime.
+native inference via ONNX Runtime. Detection runs as a **hybrid pipeline**: a fast
+lexical triage stage (DAWG dictionary lookups over the same training lexicons) advises
+the LSTM by raising or relaxing its confidence threshold, measurably improving both
+recall and precision while leaving the final decision to the model.
 
 ## Features
 
@@ -57,6 +60,7 @@ native inference via ONNX Runtime.
 | **Leaked-layout guard** | — | Rejects corrections where the source→target layout conversion would produce unmapped (leaked) characters |
 | **File-dialog protection** | `skip_file_dialog_en_protection` | When the active window is a file-open / save-as dialog (`#32770` + `DirectUIHWND` or `ComboBoxEx32`) and the current layout is English, auto-switching to Hebrew or Russian is blocked — filename entry is almost always Latin. Manual layout switches (Alt+Shift) are never affected. Controlled by **DisableAutoSwitchFromEnglishInFileDialogs** (default: on) |
 | **Case-signal Hebrew exclusion** | `EXCL: Hebrew excluded` | Hebrew has no uppercase letters. When the cached word contains ≥ *CaseExclusionMinCaps* (default **2**) alpha characters typed with Shift/CapsLock intent, **or** any internal capital (e.g. `iPhone`, `myVar`), Hebrew is removed from the candidate set before inference. Sentence-initial capitals (`"Hello"`) are **not** counted. Validated: 100 % of model Hebrew FPs on ALL-CAPS / CamelCase words eliminated; 0 real Hebrew TPs blocked. When a language is excluded the detection still considers the variant's **top-2** candidate instead of discarding the variant entirely — avoids false negatives when the correct target is the second choice |
+| **Lexical triage (hybrid pipeline)** | — | A fast dictionary stage (minimal-DAWG lexicons for en/ru/he, `triage_lexicons.bin`, ~6 MB, O(len) lookups, ~32 µs per check) that *advises* the LSTM decision: if the text **as typed** is fully attested in the current language, the switch threshold is raised (+0.08) and the Hebrew weak-signal gates are vetoed; if the **converted** switch candidate is fully attested in the target language, the threshold is relaxed (×0.80). The LSTM always makes the final call. Offline A/B result (sample 200): true positives 1116 → **1158**, false positives 1 → **0**, phrase recall unchanged. Controlled by **EnableLexicalTriage** (default: on); if the dictionary file is missing the app silently runs the pure-LSTM pipeline |
 
 ### Hebrew-specific improvements
 
@@ -124,6 +128,10 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                history.Update (once per keystroke, including pre-seed below EarlyMin)
                Incumbent-advantage gate (SwitchBiasMargin): block switch unless
                  bestConf >= incumbentConf + SwitchBiasMargin
+               Lexical triage (advisory, DAWG dictionaries en/ru/he):
+                 identity text attested in currentLang -> required += 0.08,
+                   Tier-3 →he gates vetoed (lexSuppress)
+                 else switch variant attested in bestLang -> required *= 0.80
                Top1/top2 margin gate (MinTop1Top2Margin): block if model split
                Drop-one boosting in borderline zone     (Tier 2)
                  -> runner-up recomputed from boosted variant's softmax
@@ -131,6 +139,7 @@ The pipeline runs on every keystroke while detection is active (`SEARCH = true`)
                  Tier 1: consecutive-agreement AND adaptive confidence  OR
                  Tier 3-A: persistent moderate confidence gate (→he, 6 frames, ≥0.55)  OR
                  Tier 3-B: cumulative weak score gate (→he, 7 frames avg "he" ≥0.40)
+                 (Tier 3 gates skipped when lexSuppress)
                Thresholds read from live-calibrated PairOverrides entry
 
 6. post-filter skip_file_dialog_en_protection  (en->he/ru in file dialogs)
@@ -172,6 +181,12 @@ KeyboardSwitcher/
 │   ├── test_phrases_lite.py     # Curated phrase recall with / without gates (Hebrew, Russian)
 │   ├── sweep_he_params.py   # Parameter sweep for Hebrew-target pairs
 │   ├── test_case_exclusion.py   # Validates case-signal Hebrew exclusion (ALL-CAPS, CamelCase)
+│   ├── triage.py            # Lexical triage reference implementation (dictionary evidence)
+│   ├── build_triage_artifacts.py # Builds triage_data/ lexicons from training vocabulary
+│   ├── build_cpp_triage.py  # Compiles lexicons into cpp/triage_lexicons.bin (minimal DAWG)
+│   ├── compare_pipelines.py # Baseline-vs-hybrid A/B benchmark with regression verdict
+│   ├── sweep_triage_params.py   # Triage suppress/boost parameter sweep
+│   ├── triage_data/         # Generated lexicon artifacts (gitignored)
 │   ├── requirements.txt
 │   ├── dictionary.json
 │   ├── dictionary.pkl
@@ -185,6 +200,7 @@ KeyboardSwitcher/
 │   ├── test_calibration.py  # Unit tests for the adaptive calibration controller
 │   ├── lang_model.onnx
 │   ├── dictionary.json
+│   ├── triage_lexicons.bin  # Lexical-triage DAWG dictionaries (en/ru/he)
 │   ├── keyboard.ico
 │   ├── include/
 │   │   ├── Config.h         # Version, adaptive params, language maps,
@@ -201,6 +217,7 @@ KeyboardSwitcher/
 │   │   │                    #   (Outcome enum, RecordOutcome, ResetCalibration)
 │   │   ├── InputCache.h     # Per-keystroke buffer; UpperCount, HasInternalCapital,
 │   │   │                    #   GetShiftStates (per-char capitalisation restore)
+│   │   ├── Triage.h         # LexicalTriage: DAWG dictionary reader, Evidence()
 │   │   ├── WindowTracker.h
 │   │   └── TrayIcon.h
 │   ├── src/
@@ -220,7 +237,9 @@ KeyboardSwitcher/
 │   │   │                    #   TypoResilientDetect: incumbent tracking,
 │   │   │                    #   top-2 fallback for excluded langs, honest
 │   │   │                    #   margin recompute after drop-one boost,
-│   │   │                    #   persistent + weak-score Hebrew gates
+│   │   │                    #   persistent + weak-score Hebrew gates,
+│   │   │                    #   lexical triage advisory (suppress/boost)
+│   │   ├── Triage.cpp       # DAWG loader + walker, triage Evidence impl
 │   │   ├── FeedbackLogger.cpp  # EWMA calibration controller, PairCalibration
 │   │   │                    #   state machine, exceptions/overrides with
 │   │   │                    #   case-folded keys (NormalizeKey),
@@ -249,6 +268,9 @@ pip install -r requirements.txt
 # Train the model in LangModel.ipynb, then export:
 python convert_to_onnx.py
 # Copy lang_model.onnx and dictionary.json into cpp/
+# Rebuild the triage dictionaries for the new vocabulary:
+python build_triage_artifacts.py
+python build_cpp_triage.py   # -> cpp/triage_lexicons.bin
 ```
 
 Key files:
@@ -264,6 +286,11 @@ Key files:
 | `sweep_he_params.py` | Sweep `EarlyDetectionMinChars` and `ConfidenceAtMaxChars` for Hebrew-target pairs to find the TP/FP Pareto frontier |
 | `test_phrases_lite.py` | Curated Hebrew/Russian phrase recall with and without signal-quality gates. Mirrors 17-field `PAIR_OVERRIDES` and the full gate stack (incumbent, persistent, weak-score). Reference: **91/104** WITH gates (new model; gates are neutral: WITH = WITHOUT baseline) |
 | `test_case_exclusion.py` | Validates the case-signal Hebrew exclusion: ALL-CAPS English/Russian + CamelCase → 100 % of model FPs eliminated, 0 real Hebrew TPs blocked |
+| `triage.py` | Lexical triage reference implementation (`LexicalTriage`): exact + last-word-prefix dictionary evidence over per-language lexicons. Tuned defaults locked (`boost_scale=0.80`, fuzzy/LSH off — ablation showed they hurt or add nothing) |
+| `build_triage_artifacts.py` | Builds `triage_data/` (per-language lexicons + trigram tables, gitignored) from the training vocabulary. Rerun after retraining |
+| `build_cpp_triage.py` | Compiles the lexicons into `cpp/triage_lexicons.bin` (minimal DAWG, self-verifying). Rerun after lexicon changes |
+| `compare_pipelines.py` | Baseline-vs-hybrid A/B benchmark with regression verdict. Reference: TP 1116 → **1158** (+42), FP 1 → **0**, phrases unchanged. Run: `python compare_pipelines.py --sample 200` |
+| `sweep_triage_params.py` | Grid sweep over the triage suppress/boost parameters |
 | `vocabulary/` | Word lists (English, Hebrew, Russian) for tuning |
 
 ## C++ Version
@@ -308,6 +335,7 @@ Key files:
    ├── onnxruntime_providers_shared.dll
    ├── lang_model.onnx
    ├── dictionary.json
+   ├── triage_lexicons.bin
    └── keyboard.ico
    ```
 
@@ -343,6 +371,12 @@ Global defaults (apply to any pair not listed in `PairOverrides`):
 | `WeakScoreClassIdx` | **2** | Softmax class tracked by the Cumulative Weak Score gate (2 = Hebrew) |
 | `WeakScoreMinAvg` | **0.40** | Minimum rolling average of the tracked class score for the weak-score gate to fire |
 | `WeakScoreWindow` | **7** | Number of history frames used for the rolling weak-score average |
+| `EnableLexicalTriage` | **true** | Master toggle for the lexical triage advisory stage (requires `triage_lexicons.bin` next to the exe; silently disabled if missing) |
+| `TriageSuppressThreshold` | **0.999** | Dictionary evidence for the text *as typed* in the current language required to suppress a switch (effectively "every token attested") |
+| `TriageSuppressExtra` | **0.08** | Added to the required confidence when the suppress condition holds |
+| `TriageSuppressBlocksGates` | **true** | When suppressed, also veto the Tier-3 →he weak-signal gates |
+| `TriageBoostThreshold` | **0.80** | Dictionary evidence for the *converted* switch candidate in the target language required to boost the switch |
+| `TriageBoostScale` | **0.80** | Required confidence is multiplied by this when the boost condition holds |
 
 Per-pair overrides (`Config::PairOverrides`) — factory / baseline values, validated by offline sweep on 200-word vocabulary samples (`evaluate_transitions.py --sample 200`). `ConfidenceAtMaxChars` and `MinTop1Top2Margin` are the live targets of the adaptive calibration controller (the factory values are stored as baselines; the controller applies a bounded delta on top):
 

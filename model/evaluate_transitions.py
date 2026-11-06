@@ -126,6 +126,7 @@ def evaluate_pair(
     from_lang: str,
     to_lang: str,
     model_args: list,
+    triage=None,
 ) -> Tuple[int, int, int, int]:
     params = PAIR_OVERRIDES.get((from_lang, to_lang), DEFAULT_PARAMS)
     he_params       = PAIR_OVERRIDES.get((from_lang, "he"), DEFAULT_PARAMS)
@@ -197,8 +198,10 @@ def evaluate_pair(
             best_lang = None
             best_conf = 0.0
             best_scores: list = [0.0, 0.0, 0.0, 0.0]
+            best_variant = ""
             incumbent_conf = 0.0
             he_script_vc = 0.0
+            he_script_variant = ""
             for variant in variants:
                 if variant in predict_cache:
                     lang, conf, scores = predict_cache[variant]
@@ -219,6 +222,7 @@ def evaluate_pair(
                             vc = cov * he_virtual_conf
                             if vc > he_script_vc:
                                 he_script_vc = vc
+                                he_script_variant = variant
 
                 if lang is not None:
                     # Incumbent (stay-on-current-language) strength, top-2 aware.
@@ -226,12 +230,14 @@ def evaluate_pair(
                         incumbent_conf = scores[cur_idx]
                     if conf > best_conf:
                         best_lang, best_conf, best_scores = lang, conf, scores
+                        best_variant = variant
 
             # Apply Hebrew script gate if it beats ONNX
             script_fired = False
             if he_script_vc > best_conf:
                 best_lang, best_conf = "he", he_script_vc
                 best_scores = [0.0, 0.0, 0.0, 0.0]
+                best_variant = he_script_variant
                 script_fired = True
 
             if not best_lang:
@@ -271,6 +277,23 @@ def evaluate_pair(
             if (n <= early_min + 2) and (not is_phrase) and short_extra > 0.0:
                 required = min(0.9999, required + short_extra)
 
+            # ── Lexical triage (advisory) ─────────────────────────────
+            # Suppress: the identity text (as typed) is fully attested in
+            # the current language -> raise the bar for switching away.
+            # Boost: the switch-candidate variant is well attested in the
+            # target language -> relax the bar.
+            lex_suppress = False
+            if triage is not None and best_lang != current_lang:
+                tparams = triage.params
+                inc_ev = triage.evidence(variants[0], current_lang)
+                if inc_ev >= tparams.suppress_threshold:
+                    lex_suppress = True
+                    required = min(0.9999, required + tparams.suppress_extra)
+                else:
+                    sw_ev = triage.evidence(best_variant, best_lang)
+                    if sw_ev >= tparams.boost_threshold:
+                        required = required * tparams.boost_scale
+
             update(best_lang, best_conf, [0.0, 0.0, 0.0, 0.0] if no_scores else best_scores)
 
             # Incumbent-advantage gate (FP guard)
@@ -286,7 +309,9 @@ def evaluate_pair(
             fire = False
             if (last_lang == best_lang and streak >= agreement) and best_conf >= required:
                 fire = True
-            if (not fire) and best_lang == "he":
+            if ((not fire) and best_lang == "he"
+                    and not (lex_suppress and triage is not None
+                             and triage.params.suppress_blocks_gates)):
                 if is_persistent("he", p_min_steps, p_min_avg):
                     fire = True
                 elif weak_score_avg(ws_idx, ws_win) >= ws_min:
@@ -317,7 +342,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("--min-len", type=int, default=2, help="Minimum word length")
     parser.add_argument("--max-len", type=int, default=12, help="Maximum word length")
+    parser.add_argument("--triage", action="store_true",
+                        help="Enable the lexical triage stage (advisory boost/suppress)")
+    parser.add_argument("--triage-lsh", action="store_true",
+                        help="Also enable the LSH component of the triage")
+    parser.add_argument("--triage-fuzzy", action="store_true",
+                        help="Also enable the BK-tree fuzzy component (off by default; "
+                             "tuning showed it costs TP on dense lexicons)")
     args = parser.parse_args()
+
+    triage = None
+    if args.triage or args.triage_lsh:
+        from triage import LexicalTriage
+        print("Building lexical triage dictionaries ...")
+        triage = LexicalTriage(enable_fuzzy=args.triage_fuzzy,
+                               enable_lsh=args.triage_lsh)
 
     print("Loading ONNX model...")
     model_args = Languages.load_model()
@@ -332,7 +371,8 @@ def main() -> None:
         for to_lang in LANGS:
             if from_lang == to_lang:
                 continue
-            tp, tp_total, fp, fp_total = evaluate_pair(words_by_lang, from_lang, to_lang, model_args)
+            tp, tp_total, fp, fp_total = evaluate_pair(
+                words_by_lang, from_lang, to_lang, model_args, triage=triage)
             print(
                 f"{from_lang}->{to_lang}: "
                 f"TP {tp}/{tp_total} ({tp/tp_total:.3f}), "

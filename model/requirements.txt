@@ -2,6 +2,10 @@
 numpy
 onnxruntime
 
+# Lexical triage (triage.py) optional extra: fast BK-tree build when the
+# fuzzy component is enabled (off by default; pure-python fallback exists)
+# rapidfuzz
+
 # Model training (train_model.py — v2 BiLSTM)
 #   PyTorch is the only hard training dependency; install the CUDA build for
 #   GPU training, e.g.:

@@ -151,6 +151,23 @@ namespace Config {
     extern bool  EnableWeakScoreGate;
 
     // ================================================================
+    // Lexical triage (hybrid pipeline)
+    // ================================================================
+    // Fast dictionary stage (exact + prefix DAWG lookup, see Triage.h)
+    // that advises the LSTM decision: when the text as typed is fully
+    // attested in the current language the switching bar is raised
+    // (suppress); when the switch-candidate variant is fully attested in
+    // the target language the bar is lowered (boost).  Values tuned
+    // offline (model/sweep_triage_params.py, verified FP-free on three
+    // seeds): +42..+59 TP per 1200, FP -> 0, phrase recall unchanged.
+    extern bool  EnableLexicalTriage;       // master toggle (default: true)
+    extern float TriageSuppressThreshold;   // identity evidence >= this => suppress
+    extern float TriageSuppressExtra;       // added to required confidence
+    extern bool  TriageSuppressBlocksGates; // suppress also vetoes Tier-3 →he gates
+    extern float TriageBoostThreshold;      // switch-candidate evidence >= this
+    extern float TriageBoostScale;          // multiplies required confidence
+
+    // ================================================================
     // Case-signal Hebrew exclusion (Iteration 5 — A)
     // ================================================================
     // Hebrew has no upper/lowercase. When the cached text contains

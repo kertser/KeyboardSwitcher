@@ -156,6 +156,18 @@ namespace Config {
     bool  EnablePersistentConfGate = true;
     bool  EnableWeakScoreGate      = true;
 
+    // ── Lexical triage (hybrid pipeline) ──
+    // Tuned offline on the harness (model/sweep_triage_params.py): these
+    // values are FP-free on three seeds (42/7/123) with +42..+59 TP per
+    // 1200 and unchanged phrase recall.  Keep them in sync with
+    // TriageParams in model/triage.py when retuning.
+    bool  EnableLexicalTriage       = true;
+    float TriageSuppressThreshold   = 0.999f;
+    float TriageSuppressExtra       = 0.08f;
+    bool  TriageSuppressBlocksGates = true;
+    float TriageBoostThreshold      = 0.80f;
+    float TriageBoostScale          = 0.80f;
+
     // ── Case-signal Hebrew exclusion (Iteration 5 — A) ────────────
     // Exclude "he" when ≥ CaseExclusionMinCaps alpha chars were typed
     // with Shift intent, OR any internal (non-leading) alpha char was

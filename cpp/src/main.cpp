@@ -34,6 +34,7 @@
 #include "WindowTracker.h"
 #include "TrayIcon.h"
 #include "FeedbackLogger.h"
+#include "Triage.h"
 #include "../resources/resource.h"
 
 // ============================================================
@@ -2894,6 +2895,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         return 1;
     }
     g_detector = detector.get();
+
+    // Load the lexical triage dictionaries (hybrid pipeline). Non-fatal:
+    // without them the app simply runs the pure-LSTM pipeline.
+    {
+        std::wstring triagePath = exeDir + L"\\triage_lexicons.bin";
+        if (LexicalTriage::Initialize(triagePath)) {
+            Dbg("Lexical triage loaded (triage_lexicons.bin)");
+        } else {
+            Dbg("Lexical triage NOT loaded - running pure-LSTM pipeline");
+        }
+    }
 
     // Sync the global early-out gate to the smallest per-pair EarlyMin so
     // that low-min pairs (en→he / ru→he = 3) can fire at 3 alpha chars on

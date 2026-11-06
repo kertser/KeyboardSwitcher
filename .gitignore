@@ -198,6 +198,8 @@ cython_debug/
 
 /cpp/cmake-build-debug/
 /cpp/cmake-build-release/
+# Generated lexical-triage artifacts (rebuild with model/build_triage_artifacts.py)
+/model/triage_data/
 /cpp/dist/
 .idea/
 /AGENTS.md

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(KeyboardSwitcher VERSION 1.5.0 LANGUAGES CXX)
+project(KeyboardSwitcher VERSION 1.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,6 +72,7 @@ set(SOURCES
     src/WindowTracker.cpp
     src/TrayIcon.cpp
     src/FeedbackLogger.cpp
+    src/Triage.cpp
 )
 
 set(HEADERS
@@ -81,6 +82,7 @@ set(HEADERS
     include/WindowTracker.h
     include/TrayIcon.h
     include/FeedbackLogger.h
+    include/Triage.h
     resources/resource.h
 )
 
@@ -135,6 +137,7 @@ endif()
 set(DATA_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/lang_model.onnx"
     "${CMAKE_CURRENT_SOURCE_DIR}/dictionary.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/triage_lexicons.bin"
     "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico"
 )
 
@@ -180,6 +183,7 @@ install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION .)
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/lang_model.onnx"
     "${CMAKE_CURRENT_SOURCE_DIR}/dictionary.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/triage_lexicons.bin"
     "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico"
     DESTINATION .
 )
